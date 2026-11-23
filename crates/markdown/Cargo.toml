@@ -1,0 +1,11 @@
+[package]
+name = "sage-markdown"
+description = "The preview's Markdown block tree: CommonMark with Obsidian wikilinks, embeds, tags and view blocks"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+sage-core.workspace = true
+pulldown-cmark = { version = "0.13.6", default-features = false }

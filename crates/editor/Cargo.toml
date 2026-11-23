@@ -1,0 +1,25 @@
+[package]
+name = "sage-editor"
+description = "Save policy, autocomplete, find, task write-back, templates, rename with link rewrite, three-way merge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+sage-core.workspace = true
+sage-onedrive.workspace = true
+sage-watcher.workspace = true
+regex = "1.13.1"
+similar = "3.2.1"
+rusqlite = "0.40.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+serde_yaml_ng = "0.10.0"
+
+[dev-dependencies]
+sage-db.workspace = true
+sage-indexer.workspace = true
+tempfile = "3"

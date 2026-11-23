@@ -1,0 +1,14 @@
+{
+  "templates_folder": "Templates",
+  "quick_add": [
+    {
+      "kind": "template",
+      "name": "Meeting",
+      "template": "Templates/Meeting.md",
+      "folder": "Meetings",
+      "file_name": "{{value}}",
+      "open": true,
+      "shortcut": ""
+    }
+  ]
+}

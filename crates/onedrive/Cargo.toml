@@ -1,0 +1,12 @@
+[package]
+name = "sage-onedrive"
+description = "OneDrive root detection, Files On-Demand placeholders, conflict-copy names"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+tempfile = "3"

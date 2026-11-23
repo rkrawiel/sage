@@ -1,0 +1,11 @@
+[package]
+name = "sage-core"
+description = "Domain types and the Markdown scanner (frontmatter, wikilinks, tags, tasks)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+regex = "1.13.1"
+serde_yaml_ng = "0.10.0"

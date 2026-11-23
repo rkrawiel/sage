@@ -1,0 +1,18 @@
+[package]
+name = "sage-query"
+description = "View-block DSL: parser, AST, SQL compiler, and view execution"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["std"] }
+sage-core.workspace = true
+rusqlite = "0.40.2"
+serde_yaml_ng = "0.10.0"
+
+[dev-dependencies]
+sage-db.workspace = true
+sage-indexer.workspace = true
+tempfile = "3"

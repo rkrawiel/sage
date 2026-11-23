@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT"
+
+[workspace.dependencies]
+sage-core     = { path = "crates/core" }
+sage-db       = { path = "crates/db" }
+sage-watcher  = { path = "crates/watcher" }
+sage-indexer  = { path = "crates/indexer" }
+sage-query    = { path = "crates/query" }
+sage-markdown = { path = "crates/markdown" }
+sage-editor   = { path = "crates/editor" }
+sage-onedrive = { path = "crates/onedrive" }
+sage-ui       = { path = "crates/ui" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
