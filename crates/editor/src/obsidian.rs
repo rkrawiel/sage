@@ -18,6 +18,15 @@ fn text<'a>(json: &'a serde_json::Value, key: &str) -> Option<&'a str> {
     json.get(key).and_then(|v| v.as_str()).map(str::trim)
 }
 
+/// The property types Obsidian recorded in `types.json`, by lowercase name.
+pub fn property_types(vault: &Path) -> std::collections::BTreeMap<String, String> {
+    read(vault, "types.json")
+        .get("types")
+        .and_then(|t| t.as_object())
+        .map(|o| o.iter().filter_map(|(k, v)| Some((k.to_lowercase(), v.as_str()?.to_owned()))).collect())
+        .unwrap_or_default()
+}
+
 /// One level of list indentation: a tab, as Obsidian writes by default, or
 /// spaces when `app.json` turns tabs off.
 pub fn indent_unit(vault: &Path) -> String {

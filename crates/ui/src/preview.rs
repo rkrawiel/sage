@@ -334,6 +334,28 @@ fn callout<'a>(
 fn properties<'a>(properties: &'a [Property], ctx: Ctx<'a>) -> Element<'a, Message> {
     let t = ctx.t;
     let rows = properties.iter().map(|p| {
+        // Lists, links and tags are pills that go somewhere when clicked.
+        let pills = p.values.len() != 1 || p.values.iter().any(|v| v.spans.iter().any(|s| s.link.is_some() || s.style.tag));
+        if pills && !p.values.is_empty() {
+            let cells = p.values.iter().map(|v| {
+                let label: String = v.spans.iter().map(|s| s.text.as_str()).collect();
+                let action = v.spans.iter().find_map(|s| match (&s.link, s.style.tag) {
+                    (Some(Link::Internal { target, heading, block }), _) if !is_attachment(target) => {
+                        Some(Message::FollowLink(LinkTarget::Note { target: target.clone(), heading: heading.clone(), block: block.clone() }))
+                    }
+                    (Some(Link::External(url)), _) => Some(Message::FollowLink(LinkTarget::Url(url.clone()))),
+                    (None, true) => Some(Message::SearchTag(s.text.trim_start_matches('#').to_owned())),
+                    _ => None,
+                });
+                pill(t, label, action)
+            });
+            return row![
+                container(text(&p.key).size(13).color(t.text_2)).width(Length::FillPortion(1)).max_width(140),
+                container(Row::with_children(cells).spacing(6).wrap().vertical_spacing(6)).width(Length::FillPortion(2)),
+            ]
+            .spacing(12)
+            .into();
+        }
         let mut spans = Vec::new();
         for (i, value) in p.values.iter().enumerate() {
             if i > 0 {
@@ -358,29 +380,96 @@ fn properties<'a>(properties: &'a [Property], ctx: Ctx<'a>) -> Element<'a, Messa
     container(Column::with_children(rows).spacing(4)).padding([10, 14]).width(Fill).style(move |_| theme::panel(t)).into()
 }
 
+/// A small rounded label that runs `action` when clicked, if it has one.
+fn pill<'a>(t: Tokens, label: String, action: Option<Message>) -> Element<'a, Message> {
+    let b = button(text(label).size(14)).padding([2, 8]).style(move |_, status| theme::pill(t, status));
+    match action {
+        Some(message) => b.on_press(message),
+        None => b,
+    }
+    .into()
+}
+
+/// The pill for one value of the property `key` (lower case): a wikilink goes
+/// to its note, a tag to a search for it, and in `links` a bare name to a note.
+fn value_pill<'a>(t: Tokens, key: &str, value: &str) -> Element<'a, Message> {
+    let value = value.trim();
+    if let Some(link) = sage_core::links_in_line(value).into_iter().find(|l| !l.markdown) {
+        let label = link.alias.clone().filter(|a| !a.is_empty()).unwrap_or_else(|| if link.target.is_empty() { link.heading.clone().unwrap_or_default() } else { link.target.clone() });
+        let target = LinkTarget::Note { target: link.target, heading: link.heading, block: link.block };
+        return pill(t, label, Some(Message::FollowLink(target)));
+    }
+    match key {
+        "tags" | "tag" => {
+            let tag = value.trim_start_matches('#');
+            pill(t, format!("#{tag}"), Some(Message::SearchTag(tag.to_owned())))
+        }
+        "links" => {
+            let target = LinkTarget::Note { target: value.to_owned(), heading: None, block: None };
+            pill(t, value.to_owned(), Some(Message::FollowLink(target)))
+        }
+        _ => pill(t, value.to_owned(), None),
+    }
+}
+
 /// The note's properties as live preview edits them in place: one row per
-/// top-level entry, a field for each value. Each change goes out as
-/// `Message::Property` with the entry's index and its new value.
-pub fn property_editor<'a>(entries: Vec<sage_editor::properties::Entry>, t: Tokens) -> Element<'a, Message> {
-    use sage_editor::properties::Value;
-    let field = move |value: &str, on_input: Box<dyn Fn(String) -> Message + 'a>| -> Element<'a, Message> {
-        iced::widget::text_input("", value)
-            .on_input(on_input)
-            .size(14)
-            .padding([3, 6])
-            .style(move |_, status| theme::input(t, status))
-            .into()
-    };
-    let small = move |label: &'static str, message: Message| -> Element<'a, Message> {
-        button(text(label).size(13))
-            .padding([2, 8])
-            .style(move |_, status| theme::nav_button(t, false, status))
-            .on_press(message)
-            .into()
-    };
-    let rows = entries.into_iter().enumerate().map(|(i, entry)| {
+/// top-level entry, a field for each value. A change goes out as
+/// `Message::Property`, or `PropertyTyped` from a field, which also asks for
+/// suggestions. `popup` is the suggestions, with the entry they are for; they
+/// show under its row.
+pub fn property_editor<'a>(
+    entries: Vec<(sage_editor::properties::Entry, Option<sage_editor::properties::PropType>)>,
+    popup: Option<(usize, Element<'a, Message>)>,
+    menu: Option<usize>,
+    hover: Option<(usize, usize)>,
+    editing: Option<usize>,
+    new_key: &str,
+    t: Tokens,
+) -> Element<'a, Message> {
+    use sage_editor::properties::{PropType, Value};
+    let mut popup = popup;
+    let mut rows: Vec<Element<'a, Message>> = Vec::new();
+    for (i, (entry, ty)) in entries.into_iter().enumerate() {
+        let key_lc = entry.key.to_lowercase();
+        let has_link = |text: &str| sage_core::links_in_line(text).iter().any(|l| !l.markdown);
+        // Lists and links show as pills until an edit is asked for.
+        let pillable = match &entry.value {
+            Value::List { .. } => true,
+            Value::Text { text, .. } => has_link(text),
+            _ => false,
+        };
         let editor: Element<'a, Message> = match entry.value {
-            Value::Text { text, quote } => field(&text, Box::new(move |s| Message::Property(i, Value::Text { text: s, quote }))),
+            Value::List { items, .. } if editing != Some(i) => {
+                let cells = items.iter().filter(|s| !s.trim().is_empty()).map(|s| value_pill(t, &key_lc, s));
+                Row::with_children(cells).spacing(6).wrap().vertical_spacing(6).into()
+            }
+            Value::Text { text, .. } if editing != Some(i) && has_link(&text) => {
+                let cells = sage_core::links_in_line(&text)
+                    .into_iter()
+                    .filter(|l| !l.markdown)
+                    .map(|l| value_pill(t, &key_lc, &text[l.col as usize..(l.col + l.len) as usize]));
+                Row::with_children(cells).spacing(6).wrap().vertical_spacing(6).into()
+            }
+            Value::Text { text, quote } => {
+                let (hint, numeric) = match ty {
+                    Some(PropType::Date) => ("YYYY-MM-DD", false),
+                    Some(PropType::DateTime) => ("YYYY-MM-DDTHH:MM", false),
+                    Some(PropType::Number) => ("", true),
+                    _ => ("", false),
+                };
+                iced::widget::text_input(hint, &text)
+                    .id(iced::widget::Id::from(property_id(i, 0)))
+                    .on_input(move |s| {
+                        // A number takes digits only, so it always reads back as one.
+                        let s = if numeric { s.chars().filter(|c| c.is_ascii_digit() || matches!(c, '.' | '-' | '+' | 'e' | 'E')).collect() } else { s };
+                        Message::PropertyTyped(i, None, Value::Text { text: s, quote: if numeric || !hint.is_empty() { None } else { quote } })
+                    })
+                    .on_submit(Message::PropertySubmit(i, None))
+                    .size(14)
+                    .padding([3, 6])
+                    .style(move |_, status| theme::input(t, status))
+                    .into()
+            }
             Value::Bool(on) => button(text(if on { "✓ true" } else { "false" }).size(14))
                 .padding([2, 8])
                 .style(move |_, status| theme::nav_button(t, on, status))
@@ -395,11 +484,13 @@ pub fn property_editor<'a>(entries: Vec<sage_editor::properties::Entry>, t: Toke
                     // As wide as its text, so several fit on a line.
                     let width = item.chars().count() as f32 * 8.0 + 14.0;
                     let input = iced::widget::text_input("", item)
+                        .id(iced::widget::Id::from(property_id(i, k)))
                         .on_input(move |s| {
                             let mut items = all.clone();
                             items[k] = s;
-                            Message::Property(i, Value::List { items, block })
+                            Message::PropertyTyped(i, Some(k), Value::List { items, block })
                         })
+                        .on_submit(Message::PropertySubmit(i, Some(k)))
                         .size(14)
                         .padding([2, 6])
                         .width(Length::Fixed(width.max(28.0)))
@@ -408,25 +499,114 @@ pub fn property_editor<'a>(entries: Vec<sage_editor::properties::Entry>, t: Toke
                         .padding([0, 6])
                         .style(move |_, status| theme::nav_button(t, false, status))
                         .on_press(Message::Property(i, Value::List { items: rest, block }));
+                    let hovered = hover == Some((i, k));
                     cells = cells.push(
-                        container(row![input, remove].align_y(iced::Center)).style(move |_| theme::chip(t)),
+                        iced::widget::mouse_area(
+                            container(row![input, remove].align_y(iced::Center)).style(move |_| theme::chip(t, hovered)),
+                        )
+                        .on_enter(Message::ChipHover(Some((i, k))))
+                        .on_exit(Message::ChipHover(None)),
                     );
                 }
-                let mut more = items.clone();
-                more.push(String::new());
-                cells.push(small("+", Message::Property(i, Value::List { items: more, block }))).wrap().vertical_spacing(6).into()
+                let add = button(text("+").size(13))
+                    .padding([2, 8])
+                    .style(move |_, status| theme::nav_button(t, false, status))
+                    .on_press(Message::PropertyAdd(i));
+                cells.push(add).wrap().vertical_spacing(6).into()
             }
             Value::Raw(raw) => text(raw).size(13).color(t.text_2).into(),
         };
-        row![
-            container(text(entry.key).size(13).color(t.text_2)).width(Length::FillPortion(1)).max_width(140),
-            container(editor).width(Length::FillPortion(2)),
-        ]
-        .spacing(12)
-        .align_y(iced::Center)
-        .into()
-    });
+        // The key column of the row above, so the list lines up with the value.
+        let key_width = |element: Element<'a, Message>| container(element).width(Length::FillPortion(1)).max_width(250);
+        let kind: Element<'a, Message> = match ty {
+            Some(current) => {
+                let open = menu == Some(i);
+                let button = button(text(type_icon(current)).size(12).width(Length::Fixed(22.0)).align_x(iced::Center))
+                    .padding([2, 4])
+                    .style(move |_, status| theme::nav_button(t, open, status))
+                    .on_press(Message::PropertyTypeMenu(i));
+                iced::widget::tooltip(button, text(current.label()).size(12), iced::widget::tooltip::Position::Bottom)
+                    .gap(4)
+                    .padding(4)
+                    .style(move |_| theme::panel(t))
+                    .into()
+            }
+            None => space().width(Length::Fixed(30.0)).into(),
+        };
+        let key = row![kind, text(entry.key).size(13).color(t.text_2)].spacing(8).align_y(iced::Center);
+        let remove = button(text("×").size(13))
+            .padding([0, 6])
+            .style(move |_, status| theme::nav_button(t, false, status))
+            .on_press(Message::PropertyRemove(i));
+        // Editing is asked for, so a click on a pill goes to its note instead.
+        let edit: Element<'a, Message> = if pillable {
+            let on = editing == Some(i);
+            let button = button(text(if on { "✓" } else { "✎" }).size(13))
+                .padding([0, 6])
+                .style(move |_, status| theme::nav_button(t, on, status))
+                .on_press(Message::PropertyEdit(if on { None } else { Some(i) }));
+            iced::widget::tooltip(button, text(if on { "Done" } else { "Edit" }).size(12), iced::widget::tooltip::Position::Bottom)
+                .gap(4)
+                .padding(4)
+                .style(move |_| theme::panel(t))
+                .into()
+        } else {
+            space().into()
+        };
+        rows.push(
+            row![key_width(key.into()), container(editor).width(Length::FillPortion(2)), container(edit).width(Length::Fixed(26.0)), remove]
+                .spacing(12)
+                .align_y(iced::Center)
+                .into(),
+        );
+        if let (true, Some(current)) = (menu == Some(i), ty) {
+            let mut choices = Row::new().spacing(6);
+            for choice in PropType::ALL {
+                choices = choices.push(
+                    button(text(format!("{} {}", type_icon(choice), choice.label())).size(12))
+                        .padding([2, 8])
+                        .style(move |_, status| theme::nav_button(t, choice == current, status))
+                        .on_press(Message::PropertyType(i, choice)),
+                );
+            }
+            rows.push(row![key_width(space().into()), container(choices.wrap().vertical_spacing(4)).width(Length::FillPortion(2))].spacing(12).into());
+        }
+        if popup.as_ref().is_some_and(|(at, _)| *at == i) {
+            if let Some((_, list)) = popup.take() {
+                rows.push(row![key_width(space().into()), container(list).width(Length::FillPortion(2))].spacing(12).into());
+            }
+        }
+    }
+    let add = iced::widget::text_input("Add property…", new_key)
+        .id(iced::widget::Id::from(NEW_PROPERTY))
+        .on_input(Message::NewPropertyTyped)
+        .on_submit(Message::NewPropertySubmit)
+        .size(13)
+        .padding([3, 6])
+        .style(move |_, status| theme::input(t, status));
+    rows.push(row![container(add).width(Length::FillPortion(1)).max_width(250), space().width(Length::FillPortion(2))].spacing(12).into());
     container(Column::with_children(rows).spacing(4)).padding([10, 14]).width(Fill).style(move |_| theme::panel(t)).into()
+}
+
+/// The id of the field that names a new property.
+pub const NEW_PROPERTY: &str = "property-new";
+
+/// A short mark for a property type, shown in place of its name.
+fn type_icon(ty: sage_editor::properties::PropType) -> &'static str {
+    use sage_editor::properties::PropType;
+    match ty {
+        PropType::Text => "Aa",
+        PropType::List => "≡",
+        PropType::Number => "#",
+        PropType::Checkbox => "✓",
+        PropType::Date => "D",
+        PropType::DateTime => "DT",
+    }
+}
+
+/// The id of a list item's field, so a new item can be given the focus.
+pub fn property_id(entry: usize, item: usize) -> String {
+    format!("property-{entry}-{item}")
 }
 
 fn table<'a>(alignments: &'a [Align], header: &'a [Inline], rows: &'a [Vec<Inline>], ctx: Ctx<'a>) -> Element<'a, Message> {

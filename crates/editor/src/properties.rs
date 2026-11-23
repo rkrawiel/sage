@@ -27,6 +27,125 @@ pub struct Entry {
     pub value: Value,
 }
 
+/// The kinds of property Obsidian offers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PropType {
+    Text,
+    List,
+    Number,
+    Checkbox,
+    Date,
+    DateTime,
+}
+
+impl PropType {
+    pub const ALL: [PropType; 6] = [PropType::Text, PropType::List, PropType::Number, PropType::Checkbox, PropType::Date, PropType::DateTime];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PropType::Text => "Text",
+            PropType::List => "List",
+            PropType::Number => "Number",
+            PropType::Checkbox => "Checkbox",
+            PropType::Date => "Date",
+            PropType::DateTime => "Date & time",
+        }
+    }
+
+    /// The name stored in `.sage/settings.json`.
+    pub fn id(self) -> &'static str {
+        match self {
+            PropType::Text => "text",
+            PropType::List => "list",
+            PropType::Number => "number",
+            PropType::Checkbox => "checkbox",
+            PropType::Date => "date",
+            PropType::DateTime => "datetime",
+        }
+    }
+
+    /// From either Sage's names or Obsidian's `types.json` ones.
+    pub fn from_id(id: &str) -> Option<PropType> {
+        Some(match id {
+            "text" => PropType::Text,
+            "list" | "multitext" | "tags" | "aliases" => PropType::List,
+            "number" => PropType::Number,
+            "checkbox" => PropType::Checkbox,
+            "date" => PropType::Date,
+            "datetime" => PropType::DateTime,
+            _ => return None,
+        })
+    }
+}
+
+impl std::fmt::Display for PropType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+fn digits(s: &str, n: usize) -> bool {
+    s.len() >= n && s.as_bytes()[..n].iter().all(u8::is_ascii_digit)
+}
+
+/// `YYYY-MM-DD` at the start of `s`.
+fn starts_with_date(s: &str) -> bool {
+    let b = s.as_bytes();
+    s.len() >= 10 && digits(s, 4) && b[4] == b'-' && digits(&s[5..], 2) && b[7] == b'-' && digits(&s[8..], 2)
+}
+
+/// The type `value` shows as: the one chosen for the property's name
+/// when the value can be that, else what the value looks like.
+pub fn type_of(value: &Value, chosen: Option<PropType>) -> Option<PropType> {
+    let fits = |t: PropType| match (t, value) {
+        (_, Value::Raw(_)) => false,
+        (PropType::Checkbox, v) => matches!(v, Value::Bool(_)),
+        (PropType::List, v) => matches!(v, Value::List { .. }),
+        (_, v) => matches!(v, Value::Text { .. }),
+    };
+    if matches!(value, Value::Raw(_)) {
+        return None;
+    }
+    if let Some(t) = chosen.filter(|&t| fits(t)) {
+        return Some(t);
+    }
+    Some(match value {
+        Value::Bool(_) => PropType::Checkbox,
+        Value::List { .. } => PropType::List,
+        Value::Text { text, .. } if !text.is_empty() && starts_with_date(text) => {
+            if text.len() > 10 { PropType::DateTime } else { PropType::Date }
+        }
+        Value::Text { text, .. } if !text.is_empty() && text.parse::<f64>().is_ok() => PropType::Number,
+        _ => PropType::Text,
+    })
+}
+
+/// `value` as a value of type `to`, keeping what can be kept.
+pub fn convert(value: &Value, to: PropType) -> Value {
+    let plain = |text: String| Value::Text { text, quote: None };
+    let as_text = match value {
+        Value::Text { text, .. } => text.clone(),
+        Value::Bool(b) => b.to_string(),
+        Value::List { items, .. } => items.join(", "),
+        Value::Raw(_) => return value.clone(),
+    };
+    match to {
+        PropType::Text => plain(as_text),
+        PropType::List => match value {
+            Value::List { .. } => value.clone(),
+            _ => Value::List { items: if as_text.trim().is_empty() { Vec::new() } else { vec![as_text] }, block: false },
+        },
+        PropType::Checkbox => Value::Bool(as_text.trim().eq_ignore_ascii_case("true")),
+        PropType::Number => plain(if as_text.trim().parse::<f64>().is_ok() { as_text.trim().to_owned() } else { String::new() }),
+        PropType::Date => plain(if starts_with_date(&as_text) { as_text[..10].to_owned() } else { String::new() }),
+        PropType::DateTime => plain(match as_text.trim() {
+            t if starts_with_date(t) && t.len() > 10 => t.to_owned(),
+            t if starts_with_date(t) => format!("{}T00:00", &t[..10]),
+            _ => String::new(),
+        }),
+    }
+}
+
 /// The top-level entries of the frontmatter's `lines`.
 pub fn parse(lines: &[String]) -> Vec<Entry> {
     let mut out = Vec::new();
@@ -292,6 +411,27 @@ mod tests {
         let (range, new) = set(&lines, 0, &text("New")).unwrap();
         assert_eq!((range, new), (0..1, vec!["title: New".to_owned()]));
         assert!(set(&lines, 0, &text("Old")).is_none(), "nothing changed");
+    }
+
+    #[test]
+    fn types_follow_the_choice_then_the_value() {
+        assert_eq!(type_of(&text("2024-05-01"), None), Some(PropType::Date));
+        assert_eq!(type_of(&text("2024-05-01T10:30"), None), Some(PropType::DateTime));
+        assert_eq!(type_of(&text("42"), None), Some(PropType::Number));
+        assert_eq!(type_of(&text(""), Some(PropType::Date)), Some(PropType::Date));
+        assert_eq!(type_of(&text("hello"), Some(PropType::Checkbox)), Some(PropType::Text));
+        assert_eq!(type_of(&Value::Raw("a".into()), Some(PropType::Text)), None);
+    }
+
+    #[test]
+    fn converting_keeps_what_fits() {
+        assert_eq!(convert(&text("2024-05-01T10:30"), PropType::Date), text("2024-05-01"));
+        assert_eq!(convert(&text("2024-05-01"), PropType::DateTime), text("2024-05-01T00:00"));
+        assert_eq!(convert(&text("abc"), PropType::Number), text(""));
+        assert_eq!(convert(&text("true"), PropType::Checkbox), Value::Bool(true));
+        assert_eq!(convert(&Value::Bool(true), PropType::Text), text("true"));
+        assert_eq!(convert(&text("a"), PropType::List), Value::List { items: vec!["a".into()], block: false });
+        assert_eq!(convert(&Value::List { items: vec!["a".into(), "b".into()], block: true }, PropType::Text), text("a, b"));
     }
 
     #[test]

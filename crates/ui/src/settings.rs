@@ -185,6 +185,18 @@ pub fn view(ctx: Ctx<'_>) -> Element<'_, Message> {
     page = page.push(hint(
         "Insert template and Quick Add take their templates from here. Obsidian's own setting is left as it is.".into(),
     ));
+    let none = Pick { value: String::new(), label: "None, an empty note".into() };
+    let mut choices = vec![none.clone()];
+    choices.extend(ctx.templates.iter().map(|path| Pick { value: path.clone(), label: crate::file_stem(path).to_owned() }));
+    let current = match &ctx.settings.new_note_template {
+        Some(path) => choices.iter().find(|p| p.value == *path).cloned().unwrap_or_else(|| Pick {
+            value: path.clone(),
+            label: format!("{path} (not in the templates folder)"),
+        }),
+        None => none,
+    };
+    page = page.push(labelled("New note template", choose(choices, current, Message::SettingsNewNoteTemplate, t)));
+    page = page.push(hint("Ctrl+N and the New note button start a note from this template.".into()));
 
     // Quick Add.
     page = page.push(container(section("QUICK ADD")).padding(iced::Padding { top: 12.0, ..iced::Padding::ZERO }));

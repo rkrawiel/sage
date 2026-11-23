@@ -155,10 +155,24 @@ pub fn surface(t: Tokens) -> container::Style {
 
 /// A list item of the properties: a hairline box that holds its field and
 /// its remove button.
-pub fn chip(t: Tokens) -> container::Style {
+pub fn chip(t: Tokens, hovered: bool) -> container::Style {
+    // A light wash of the accent while the pointer is over it.
+    let (fill, border) = if hovered { (Color { a: 0.22, ..t.accent }, t.accent) } else { (t.surface, t.border) };
     container::Style {
-        border: Border { color: t.border, width: 1.0, radius: RADIUS.into() },
-        ..flat(Some(t.surface), t.text)
+        border: Border { color: border, width: 1.0, radius: RADIUS.into() },
+        ..flat(Some(fill), t.text)
+    }
+}
+
+/// A tag or link shown as a label: a light wash of the accent when hovered.
+pub fn pill(t: Tokens, status: button::Status) -> button::Style {
+    let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+    button::Style {
+        background: Some(Background::Color(if hovered { Color { a: 0.22, ..t.accent } } else { t.surface })),
+        text_color: if hovered { t.accent_2 } else { t.text },
+        border: Border { color: if hovered { t.accent } else { t.border }, width: 1.0, radius: RADIUS.into() },
+        shadow: Shadow::default(),
+        snap: true,
     }
 }
 

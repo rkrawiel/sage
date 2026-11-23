@@ -59,6 +59,8 @@ pub struct LiveEditor<'a, Message> {
     /// them, by the lines they span: tables, embeds, views, the properties.
     islands: Vec<(Range<usize>, Element<'a, Message>)>,
     editable: Option<Range<usize>>,
+    /// Drawn under the caret, over the text, such as the suggestions.
+    popup: Option<Element<'a, Message>>,
 }
 
 impl<'a, Message> LiveEditor<'a, Message> {
@@ -79,13 +81,21 @@ impl<'a, Message> LiveEditor<'a, Message> {
             key_binding: Box::new(key_binding),
             islands: Vec::new(),
             editable: None,
+            popup: None,
         }
+    }
+
+    /// Something to show just under the caret, or above it when there is no
+    /// room below.
+    pub fn popup(mut self, popup: Option<Element<'a, Message>>) -> Self {
+        self.popup = popup;
+        self
     }
 
     /// The lines of an island that is edited in place, such as the properties.
     /// It stays drawn while the cursor merely rests in it, and clicks in it
-    /// belong to its own widgets. Only a cursor moved in with the keys while
-    /// the editor has focus shows it as written, so it can still be edited raw.
+    /// belong to its own widgets. The cursor never turns it into text, as it
+    /// starts on the first line when a note opens; source mode shows it raw.
     pub fn editable(mut self, lines: Option<Range<usize>>) -> Self {
         self.editable = lines;
         self
@@ -511,11 +521,11 @@ impl<Message> Widget<Message, Theme, Renderer> for LiveEditor<'_, Message> {
     }
 
     fn children(&self) -> Vec<Tree> {
-        self.islands.iter().map(|(_, element)| Tree::new(element)).collect()
+        self.islands.iter().map(|(_, element)| Tree::new(element)).chain(self.popup.as_ref().map(Tree::new)).collect()
     }
 
     fn diff(&self, tree: &mut Tree) {
-        let elements: Vec<&Element<'_, Message>> = self.islands.iter().map(|(_, e)| e).collect();
+        let elements: Vec<&Element<'_, Message>> = self.islands.iter().map(|(_, e)| e).chain(self.popup.as_ref()).collect();
         tree.diff_children(&elements);
     }
 
@@ -525,13 +535,12 @@ impl<Message> Widget<Message, Theme, Renderer> for LiveEditor<'_, Message> {
         // A block shows as written while the cursor or selection is in it.
         let caret = caret_of(self.content);
         let island_limits = layout::Limits::new(Size::ZERO, Size::new(width, f32::INFINITY));
-        let focused = tree.state.downcast_ref::<State>().focused;
         let mut nodes = Vec::with_capacity(self.islands.len());
         let mut heights = Vec::new();
         let mut rendered = Vec::with_capacity(self.islands.len());
         for ((lines, element), child) in self.islands.iter_mut().zip(&mut tree.children) {
             let editable = self.editable.as_ref() == Some(lines);
-            let raw = live::touches_island(lines, caret) && (!editable || focused);
+            let raw = live::touches_island(lines, caret) && !editable;
             rendered.push(!raw);
             if raw {
                 nodes.push(layout::Node::new(Size::ZERO));
@@ -552,6 +561,19 @@ impl<Message> Widget<Message, Theme, Renderer> for LiveEditor<'_, Message> {
                 *node = node.clone().move_to(Point::new(state.left, laid.top + ISLAND_GAP - state.scroll));
             }
         }
+        // The popup goes under the caret, or above it at the bottom of the pane.
+        if let Some(popup) = self.popup.as_mut() {
+            let child = &mut tree.children[self.islands.len()];
+            let limits = layout::Limits::new(Size::ZERO, Size::new((size.width - 16.0).min(560.0), size.height));
+            let node = popup.as_widget_mut().layout(child, renderer, &limits);
+            let state = tree.state.downcast_ref::<State>();
+            let (x, top, h) = state.caret_point(self.content.cursor().position).unwrap_or((0.0, 0.0, 0.0));
+            let (x, top) = (state.left + x, top - state.scroll);
+            let below = top + h + 4.0;
+            let y = if below + node.size().height > size.height { (top - node.size().height - 4.0).max(0.0) } else { below };
+            let x = x.min(size.width - node.size().width - 8.0).max(0.0);
+            nodes.push(node.move_to(Point::new(x, y)));
+        }
         layout::Node::with_children(size, nodes)
     }
 
@@ -568,6 +590,17 @@ impl<Message> Widget<Message, Theme, Renderer> for LiveEditor<'_, Message> {
     ) {
         let bounds = layout.bounds();
         tree.state.downcast_mut::<State>().track(event);
+        // The popup is on top, so it takes its events first.
+        if let Some(popup) = self.popup.as_mut() {
+            let n = self.islands.len();
+            if let Some(node) = layout.children().nth(n) {
+                let inner = if cursor.is_over(bounds) { cursor } else { mouse::Cursor::Unavailable };
+                popup.as_widget_mut().update(&mut tree.children[n], event, node, inner, renderer, clipboard, shell, &bounds);
+                if shell.is_event_captured() {
+                    return;
+                }
+            }
+        }
         // Rendered blocks first: their links, checkboxes and boards. They are
         // scrolled within the pane, so the pointer counts only inside it.
         let inner = if cursor.is_over(bounds) { cursor } else { mouse::Cursor::Unavailable };
@@ -835,6 +868,15 @@ impl<Message> Widget<Message, Theme, Renderer> for LiveEditor<'_, Message> {
                 }
             }
         });
+        // The popup, over everything.
+        if let Some(popup) = &self.popup {
+            let n = self.islands.len();
+            if let (Some(node), Some(child)) = (layout.children().nth(n), tree.children.get(n)) {
+                renderer.with_layer(bounds, |renderer| {
+                    popup.as_widget().draw(child, renderer, theme, style, node, pointer, &bounds);
+                });
+            }
+        }
     }
 
     fn mouse_interaction(
@@ -848,6 +890,12 @@ impl<Message> Widget<Message, Theme, Renderer> for LiveEditor<'_, Message> {
         let state = tree.state.downcast_ref::<State>();
         let bounds = layout.bounds();
         let Some(p) = cursor.position_over(bounds) else { return mouse::Interaction::default() };
+        if let Some(popup) = &self.popup {
+            let n = self.islands.len();
+            if let Some(node) = layout.children().nth(n).filter(|node| cursor.is_over(node.bounds())) {
+                return popup.as_widget().mouse_interaction(&tree.children[n], node, cursor, &bounds, renderer);
+            }
+        }
         for ((((_, element), child), node), shown) in
             self.islands.iter().zip(&tree.children).zip(layout.children()).zip(&state.rendered)
         {
@@ -859,6 +907,28 @@ impl<Message> Widget<Message, Theme, Renderer> for LiveEditor<'_, Message> {
             Some(Hit::Checkbox(_) | Hit::Link(..)) => mouse::Interaction::Pointer,
             _ => mouse::Interaction::Text,
         }
+    }
+
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut Tree,
+        layout: Layout<'b>,
+        renderer: &Renderer,
+        viewport: &Rectangle,
+        translation: iced::Vector,
+    ) -> Option<iced::advanced::overlay::Element<'b, Message, Theme, Renderer>> {
+        // The menus and tooltips of the drawn blocks, such as a property's type list.
+        let shown = tree.state.downcast_ref::<State>().rendered.clone();
+        let overlays: Vec<_> = self
+            .islands
+            .iter_mut()
+            .zip(&mut tree.children)
+            .zip(layout.children())
+            .zip(shown)
+            .filter(|(_, shown)| *shown)
+            .filter_map(|((((_, element), child), node), _)| element.as_widget_mut().overlay(child, node, renderer, viewport, translation))
+            .collect();
+        (!overlays.is_empty()).then(|| iced::advanced::overlay::Group::with_children(overlays).overlay())
     }
 
     fn operate(&mut self, tree: &mut Tree, layout: Layout<'_>, renderer: &Renderer, operation: &mut dyn widget::Operation) {

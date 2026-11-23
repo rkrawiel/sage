@@ -50,7 +50,11 @@ fn links(db: &Connection, query: &str, notes_first: bool) -> rusqlite::Result<Ve
     for row in rows {
         let (path, title, ext, name_key) = row?;
         let value = link_text(db, &path, &ext, &name_key)?;
-        out.push(Suggestion { label: title, detail: path, value });
+        // The file's own name is what a link says, so it is the label; a differing title goes beside the folder.
+        let file = path.rsplit('/').next().unwrap_or(&path);
+        let stem = if ext == "md" { file.strip_suffix(".md").unwrap_or(file) } else { file }.to_owned();
+        let detail = if title != stem && ext == "md" { format!("{title} · {path}") } else { path };
+        out.push(Suggestion { label: stem, detail, value });
     }
 
     if !query.is_empty() && out.len() < LIMIT {

@@ -212,6 +212,7 @@ enum Message {
     SettingsSaved(Result<(), String>),
     ToggleSettings,
     SettingsTemplatesFolder(settings::Pick),
+    SettingsNewNoteTemplate(settings::Pick),
     QuickAddEdit(usize, settings::Field),
     /// A new Quick Add entry: a capture entry, or a template entry.
     QuickAddNew(bool),
@@ -274,6 +275,31 @@ enum Message {
     /// An entry of the note's properties, by its index, set from the widget
     /// that live preview draws in place of the frontmatter.
     Property(usize, sage_editor::properties::Value),
+    /// A field of the properties typed in: entry, list item, new value.
+    PropertyTyped(usize, Option<usize>, sage_editor::properties::Value),
+    /// Enter in a field: accepts the suggestion, else makes a link property's
+    /// text a link.
+    PropertySubmit(usize, Option<usize>),
+    PropertyPick(usize),
+    /// Property `entry` is given a type: its value is converted and the
+    /// choice kept for that name.
+    PropertyType(usize, sage_editor::properties::PropType),
+    /// Opens or closes the list of types under property `entry`.
+    PropertyTypeMenu(usize),
+    /// Removes property `entry` altogether.
+    PropertyRemove(usize),
+    /// The pointer is over list item `(entry, item)`, or over none.
+    ChipHover(Option<(usize, usize)>),
+    /// Search everywhere for a tag, from a tag pill.
+    SearchTag(String),
+    /// Starts (`Some`) or ends editing the pills of property entry `n`.
+    PropertyEdit(Option<usize>),
+    NewPropertyTyped(String),
+    NewPropertySubmit,
+    /// Whether an empty list item still has the focus; once it has not, it goes.
+    PropertyBlur(usize, usize, bool),
+    /// A new, empty item at the end of a list.
+    PropertyAdd(usize),
     Tick,
     CompleteMove(i32),
     CompletePick(usize),
@@ -620,6 +646,15 @@ struct App {
     /// Esc already closed the completion popup; the same key press reaches the
     /// global shortcut listener afterwards and must not close the find bar too.
     escape_used: bool,
+    /// Suggestions under a field of the properties widget.
+    prop_complete: Option<PropCompletion>,
+    /// The name being typed for a new property.
+    new_property: String,
+    /// The property whose list of types is open.
+    type_menu: Option<usize>,
+    chip_hover: Option<(usize, usize)>,
+    /// The note and entry whose pills are being edited; the rest show as pills.
+    editing_prop: Option<(String, usize)>,
     find: Option<Find>,
     /// The vault-wide task list, shown in place of the note while open.
     tasks: Option<TaskList>,
@@ -653,6 +688,8 @@ struct App {
     recording_built_in: Option<usize>,
     /// The vault's Sage settings, from `.sage/settings.json`.
     settings: sage_editor::settings::Settings,
+    /// Property types from Obsidian's `types.json`, read once at start.
+    obsidian_types: std::collections::BTreeMap<String, String>,
     /// The settings panel is shown in place of the note.
     settings_open: bool,
     /// When the settings last changed, while that is not saved yet.
@@ -994,6 +1031,60 @@ impl Tab {
         Some(lines[1..1 + close].to_vec())
     }
 
+    /// Entry `index` of the frontmatter.
+    fn property(&self, index: usize) -> Option<sage_editor::properties::Entry> {
+        sage_editor::properties::parse(&self.frontmatter_lines()?).into_iter().nth(index)
+    }
+
+    /// Appends an empty property called `key` to the frontmatter, as a list
+    /// for the names that hold lists. Gives its index, or `None` when the
+    /// name is unusable or taken, or the note has no frontmatter.
+    fn add_property(&mut self, key: &str) -> Option<usize> {
+        use sage_editor::properties::{parse, write, Value};
+        if key.is_empty() || key.contains([':', '#', '[', ']', '"', '\'']) {
+            return None;
+        }
+        let inner = self.frontmatter_lines()?;
+        let entries = parse(&inner);
+        if entries.iter().any(|e| e.key.eq_ignore_ascii_case(key)) {
+            return None;
+        }
+        let value = if matches!(key.to_lowercase().as_str(), "tags" | "aliases" | "cssclasses") || is_link_property(key) {
+            Value::List { items: vec![String::new()], block: false }
+        } else {
+            Value::Text { text: String::new(), quote: None }
+        };
+        let fence = inner.len() + 1;
+        let text = self.with_ending(&format!("{}\n", write(key, &value).join("\n")));
+        self.checkpoint(sage_editor::undo::Kind::Other);
+        let cursor = self.content.cursor().position;
+        self.content.move_to(Cursor { position: Position { line: fence, column: 0 }, selection: None });
+        self.content.perform(text_editor::Action::Edit(Edit::Paste(Arc::new(text))));
+        let line = if cursor.line >= fence { cursor.line + 1 } else { cursor.line };
+        self.put_cursor(line, cursor.column);
+        self.mark_edited();
+        Some(entries.len())
+    }
+
+    /// Removes entry `index` from the frontmatter, all its lines, as one edit.
+    fn remove_property(&mut self, index: usize) {
+        let Some(inner) = self.frontmatter_lines() else { return };
+        let Some(entry) = sage_editor::properties::parse(&inner).into_iter().nth(index) else { return };
+        // Within the note, past the opening fence; the closing fence always follows.
+        let (first, after) = (entry.lines.start + 1, entry.lines.end + 1);
+        self.checkpoint(sage_editor::undo::Kind::Other);
+        let cursor = self.content.cursor().position;
+        self.content.move_to(Cursor {
+            position: Position { line: after, column: 0 },
+            selection: Some(Position { line: first, column: 0 }),
+        });
+        self.content.perform(text_editor::Action::Edit(Edit::Delete));
+        let gone = after - first;
+        let line = if cursor.line >= after { cursor.line - gone } else if cursor.line >= first { first } else { cursor.line };
+        self.put_cursor(line, if cursor.line >= after { cursor.column } else { 0 });
+        self.mark_edited();
+    }
+
     /// Sets entry `index` of the frontmatter from the properties widget as
     /// an edit that autosave then writes, leaving the cursor on its text.
     fn set_property(&mut self, index: usize, value: &sage_editor::properties::Value) {
@@ -1174,6 +1265,24 @@ struct Completion {
     selected: usize,
 }
 
+/// Suggestions for a field of the properties widget, shown under its row.
+struct PropCompletion {
+    /// The note the field belongs to.
+    tab: String,
+    entry: usize,
+    /// Which item of a list, or `None` for a text value.
+    item: Option<usize>,
+    ctx: complete::Context,
+    items: Vec<Suggestion>,
+    selected: usize,
+}
+
+/// The properties whose values are links to notes: typing in one suggests
+/// notes as `[[` does, and what is picked or typed is written as `[[Note]]`.
+fn is_link_property(key: &str) -> bool {
+    key.eq_ignore_ascii_case("links")
+}
+
 /// Find in the active note. Closed when another tab becomes active.
 #[derive(Default)]
 struct Find {
@@ -1260,6 +1369,11 @@ impl App {
             before_live: ViewMode::Source,
             palette: None,
             completion: None,
+            prop_complete: None,
+            new_property: String::new(),
+            type_menu: None,
+            chip_hover: None,
+            editing_prop: None,
             dismissed: None,
             escape_used: false,
             find: None,
@@ -1279,6 +1393,7 @@ impl App {
             recording: None,
             recording_built_in: None,
             settings: sage_editor::settings::Settings::default(),
+            obsidian_types: Default::default(),
             settings_open: false,
             settings_changed: None,
             settings_error: None,
@@ -1304,6 +1419,7 @@ impl App {
             zoom,
         };
         app.indent_unit = sage_editor::obsidian::indent_unit(&app.vault);
+        app.obsidian_types = sage_editor::obsidian::property_types(&app.vault);
         // The interface's units are scaled by the zoom.
         app.window_width /= app.zoom;
         // Instant start: the tree is drawn from the cached index before the
@@ -1540,6 +1656,10 @@ impl App {
                 self.settings.templates_folder = (!pick.value.is_empty()).then_some(pick.value);
                 self.settings_edited();
             }
+            Message::SettingsNewNoteTemplate(pick) => {
+                self.settings.new_note_template = (!pick.value.is_empty()).then_some(pick.value);
+                self.settings_edited();
+            }
             Message::QuickAddEdit(i, field) => {
                 if let Some(entry) = self.settings.quick_add.get_mut(i) {
                     settings::apply(entry, field);
@@ -1701,7 +1821,7 @@ impl App {
                 if self.resizing.take().is_some() {
                     self.persist();
                 }
-                let Some(drag) = self.drag.take() else { return Task::none() };
+                let Some(drag) = self.drag.take() else { return self.prune_check() };
                 return match drag.over {
                     Some(column) if column != drag.from => {
                         self.place_card(&drag, column);
@@ -1755,6 +1875,7 @@ impl App {
                     return Task::none();
                 };
                 let is_edit = action.is_edit();
+                self.prop_complete = None;
                 if is_edit {
                     let typing = matches!(
                         action,
@@ -1810,6 +1931,7 @@ impl App {
                     tab.history.break_group();
                     self.completion = None;
                     self.dismissed = None;
+                    self.prop_complete = None;
                 }
                 live_editor::Event::Follow(source) => {
                     if let Some(link) = link_target(&source) {
@@ -1819,8 +1941,108 @@ impl App {
                 live_editor::Event::Toggle(line) => return self.handle(Message::PreviewTask(line as u32)),
             },
             Message::Property(index, value) => {
+                self.prop_complete = None;
                 if let Some(tab) = self.tabs.get_mut(self.active).filter(|t| t.loaded) {
                     tab.set_property(index, &value);
+                }
+            }
+            Message::PropertyTyped(entry, item, value) => {
+                if let Some(tab) = self.tabs.get_mut(self.active).filter(|t| t.loaded) {
+                    tab.set_property(entry, &value);
+                    self.refresh_prop_completion(entry, item, &value);
+                }
+            }
+            Message::PropertySubmit(entry, item) => self.submit_property(entry, item),
+            Message::PropertyBlur(entry, item, focused) => {
+                if !focused && self.drop_empty_item(entry, item) {
+                    self.prop_complete = None;
+                    return self.prune_check();
+                }
+            }
+            Message::NewPropertyTyped(s) => self.new_property = s,
+            Message::NewPropertySubmit => {
+                let key = std::mem::take(&mut self.new_property).trim().to_owned();
+                let Some(tab) = self.tabs.get_mut(self.active).filter(|t| t.loaded) else { return Task::none() };
+                if let Some(entry) = tab.add_property(&key) {
+                    self.editing_prop = Some((tab.path.clone(), entry));
+                    return iced::widget::operation::focus(iced::widget::Id::from(preview::property_id(entry, 0)));
+                }
+            }
+            Message::ChipHover(at) => self.chip_hover = at,
+            Message::SearchTag(tag) => {
+                // Close a search that is already open, which the command would toggle off.
+                self.palette = None;
+                let open = self.run(Command::SearchEverywhere);
+                if let Some(palette) = &mut self.palette {
+                    palette.query = format!("#{tag}");
+                }
+                self.search();
+                return open;
+            }
+            Message::PropertyEdit(None) => {
+                self.editing_prop = None;
+                self.prop_complete = None;
+                return self.prune_check();
+            }
+            Message::PropertyEdit(Some(entry)) => {
+                self.prop_complete = None;
+                let Some(tab) = self.tabs.get_mut(self.active).filter(|t| t.loaded) else { return Task::none() };
+                self.editing_prop = Some((tab.path.clone(), entry));
+                let focus = match tab.property(entry).map(|e| e.value) {
+                    Some(sage_editor::properties::Value::List { mut items, block }) => {
+                        if items.is_empty() {
+                            items.push(String::new());
+                            tab.set_property(entry, &sage_editor::properties::Value::List { items: items.clone(), block });
+                        }
+                        items.len() - 1
+                    }
+                    _ => 0,
+                };
+                return iced::widget::operation::focus(iced::widget::Id::from(preview::property_id(entry, focus)));
+            }
+            Message::PropertyRemove(i) => {
+                self.editing_prop = None;
+                self.prop_complete = None;
+                self.type_menu = None;
+                if let Some(tab) = self.tabs.get_mut(self.active).filter(|t| t.loaded) {
+                    tab.remove_property(i);
+                }
+            }
+            Message::PropertyTypeMenu(i) => self.type_menu = if self.type_menu == Some(i) { None } else { Some(i) },
+            Message::PropertyType(entry, ty) => {
+                self.prop_complete = None;
+                self.type_menu = None;
+                let Some(tab) = self.tabs.get_mut(self.active).filter(|t| t.loaded) else { return Task::none() };
+                let Some(current) = tab.property(entry) else { return Task::none() };
+                let key = current.key.to_lowercase();
+                let value = sage_editor::properties::convert(&current.value, ty);
+                tab.set_property(entry, &value);
+                self.settings.property_types.insert(key, ty.id().to_owned());
+                self.settings_edited();
+            }
+            Message::PropertyPick(i) => self.accept_property(Some(i)),
+            Message::PropertyAdd(entry) => {
+                self.prop_complete = None;
+                let Some(tab) = self.tabs.get_mut(self.active).filter(|t| t.loaded) else { return Task::none() };
+                let Some(sage_editor::properties::Value::List { mut items, block }) = tab.property(entry).map(|e| e.value) else {
+                    return Task::none();
+                };
+                items.push(String::new());
+                let next = items.len() - 1;
+                tab.set_property(entry, &sage_editor::properties::Value::List { items, block });
+                return iced::widget::operation::focus(iced::widget::Id::from(preview::property_id(entry, next)));
+            }
+            // Keys for the suggestions under a property field, which has the focus.
+            Message::Key(Shortcut::Escape) if self.prop_complete.is_some() => self.prop_complete = None,
+            Message::Key(Shortcut::Escape) if self.editing_prop.is_some() && self.palette.is_none() => {
+                self.editing_prop = None;
+                return self.prune_check();
+            }
+            Message::Key(Shortcut::Tab) if self.prop_complete.is_some() => self.accept_property(None),
+            Message::Key(direction @ (Shortcut::Up | Shortcut::Down)) if self.prop_complete.is_some() => {
+                if let Some(c) = &mut self.prop_complete {
+                    let last = c.items.len().saturating_sub(1);
+                    c.selected = if matches!(direction, Shortcut::Up) { c.selected.saturating_sub(1) } else { (c.selected + 1).min(last) };
                 }
             }
             Message::Tick => {
@@ -2514,6 +2736,9 @@ impl App {
         self.palette = None;
         let vault = self.vault.clone();
         let name = name.map(sanitize_note_name);
+        // Only a note without a name starts from the default template.
+        let template = if name.as_deref().is_none_or(str::is_empty) { self.settings.new_note_template.clone() } else { None };
+        let (config, now) = (self.template_config(), sage_editor::now());
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
@@ -2524,6 +2749,10 @@ impl App {
                             .find(|candidate| !vault.join(candidate).exists())
                             .expect("an unused name exists"),
                     };
+                    if let Some(template) = template.filter(|t| vault.join(t).is_file()) {
+                        sage_editor::quick_add::create_note(&vault, &rel, &template, "", now, &config)?;
+                        return Ok(rel);
+                    }
                     let abs = vault.join(&rel);
                     if let Some(parent) = abs.parent() {
                         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -3536,6 +3765,13 @@ impl App {
         config
     }
 
+    /// The type chosen for property `key`: Sage's own choice, else Obsidian's.
+    fn chosen_type(&self, key: &str) -> Option<sage_editor::properties::PropType> {
+        let key = key.to_lowercase();
+        let id = self.settings.property_types.get(&key).or_else(|| self.obsidian_types.get(&key))?;
+        sage_editor::properties::PropType::from_id(id)
+    }
+
     /// Notes the settings changed; autosave writes them shortly.
     fn settings_edited(&mut self) {
         self.settings_changed = Some(Instant::now());
@@ -3646,8 +3882,8 @@ impl App {
 
     /// Opens the palette on the Quick Add entries, or the settings to make one.
     fn start_quick_add(&mut self) -> Task<Message> {
-        if self.settings.quick_add.is_empty() {
-            self.notice("No Quick Add entries yet: add one here".into());
+        if self.quick_entries().is_empty() {
+            self.notice("No Quick Add entries or templates yet: add one here".into());
             self.settings_open = true;
             self.tasks = None;
             return Task::none();
@@ -3658,10 +3894,26 @@ impl App {
         iced::widget::operation::focus(PALETTE_INPUT)
     }
 
+    /// The Quick Add entries: the vault's own, then one for every note in the
+    /// templates folder, so each template can start a note without any setup.
+    fn quick_entries(&self) -> Vec<QuickAdd> {
+        let prefix = format!("{}/", self.template_config().folder);
+        let own = self.settings.quick_add.iter().cloned();
+        let templates = self.files.iter().filter(|f| f.path.starts_with(&prefix) && f.path.ends_with(".md")).map(|f| QuickAdd::Template {
+            name: f.title.clone(),
+            template: f.path.clone(),
+            folder: String::new(),
+            file_name: "{{value}}".into(),
+            open: true,
+            shortcut: String::new(),
+        });
+        own.chain(templates).collect()
+    }
+
     /// Runs Quick Add entry `i`, asking for its value first if it needs one.
     fn choose_quick_add(&mut self, i: usize) -> Task<Message> {
-        let Some(entry) = self.settings.quick_add.get(i) else { return Task::none() };
-        if !needs_value(entry) {
+        let Some(entry) = self.quick_entries().into_iter().nth(i) else { return Task::none() };
+        if !needs_value(&entry) {
             return self.run_quick_add(i, String::new());
         }
         self.completion = None;
@@ -3674,7 +3926,7 @@ impl App {
     fn quick_add_path(&self, i: usize, value: &str) -> Option<String> {
         let (config, now) = (self.template_config(), sage_editor::now());
         let fill = |pattern: &str| sage_editor::quick_add::fill(pattern, value, now, &config);
-        let rel = match self.settings.quick_add.get(i)? {
+        let rel = match self.quick_entries().get(i)? {
             QuickAdd::Template { folder, file_name, .. } => {
                 let name = if file_name.trim().is_empty() { "{{value}}" } else { file_name.as_str() };
                 sanitize_note_name(&format!("{}/{}", fill(folder), fill(name)))
@@ -3686,7 +3938,7 @@ impl App {
 
     fn run_quick_add(&mut self, i: usize, value: String) -> Task<Message> {
         self.palette = None;
-        let Some(entry) = self.settings.quick_add.get(i).cloned() else { return Task::none() };
+        let Some(entry) = self.quick_entries().into_iter().nth(i) else { return Task::none() };
         let Some(rel) = self.quick_add_path(i, &value) else {
             self.notice(format!("{} would make a note without a name", entry.name()));
             return Task::none();
@@ -3731,7 +3983,8 @@ impl App {
     /// The palette while asking for Quick Add entry `i`'s value: what Enter
     /// will create or add to.
     fn value_hits(&self, i: usize, value: &str) -> Vec<Hit> {
-        let Some(entry) = self.settings.quick_add.get(i) else { return Vec::new() };
+        let entries = self.quick_entries();
+        let Some(entry) = entries.get(i) else { return Vec::new() };
         let ask = match entry {
             QuickAdd::Template { .. } => "Type the new note's name",
             QuickAdd::Capture { .. } => "Type what to add",
@@ -3914,6 +4167,132 @@ impl App {
         self.completion = Some(Completion { ctx, line: line_no, items, selected });
     }
 
+    /// Suggests notes for what is typed in a field of the properties widget,
+    /// as `[[` does in the text. In a link property the whole text is the name.
+    fn refresh_prop_completion(&mut self, entry: usize, item: Option<usize>, value: &sage_editor::properties::Value) {
+        use sage_editor::properties::Value;
+        self.prop_complete = None;
+        let (Some(tab), Some(reader)) = (self.tabs.get(self.active), &self.reader) else { return };
+        let Some(key) = tab.property(entry).map(|e| e.key) else { return };
+        let text = match (value, item) {
+            (Value::Text { text, .. }, _) => text.clone(),
+            (Value::List { items, .. }, Some(k)) => items.get(k).cloned().unwrap_or_default(),
+            _ => return,
+        };
+        let link_property = is_link_property(&key);
+        let ctx = if link_property {
+            let linked = text.len() >= 4 && text.starts_with("[[") && text.ends_with("]]");
+            (!linked).then(|| complete::Context {
+                kind: complete::Kind::Link,
+                query: text.trim_start_matches('[').trim_end_matches(']').to_owned(),
+                start: 0,
+                closed: false,
+            })
+        } else {
+            complete::context(&text, text.len()).filter(|c| c.kind == complete::Kind::Link)
+        };
+        let Some(ctx) = ctx else { return };
+        let mut items = suggest::for_context(reader, &ctx);
+        // A name that matches no note links to one that following the link creates.
+        let query = ctx.query.trim();
+        if link_property && !query.is_empty() && !items.iter().any(|i| i.value.eq_ignore_ascii_case(query)) {
+            items.push(Suggestion { label: format!("Create “{query}”"), detail: "new note".into(), value: query.to_owned() });
+        }
+        if items.is_empty() {
+            return;
+        }
+        self.prop_complete = Some(PropCompletion { tab: tab.path.clone(), entry, item, ctx, items, selected: 0 });
+    }
+
+    /// Writes the picked suggestion (the highlighted one for `None`) into its field.
+    fn accept_property(&mut self, pick: Option<usize>) {
+        use sage_editor::properties::Value;
+        let Some(c) = self.prop_complete.take() else { return };
+        let Some(suggestion) = c.items.get(pick.unwrap_or(c.selected)) else { return };
+        let Some(tab) = self.tabs.get_mut(self.active).filter(|t| t.loaded && t.path == c.tab) else { return };
+        let Some(entry) = tab.property(c.entry) else { return };
+        let write = |text: &str| {
+            if is_link_property(&entry.key) {
+                format!("[[{}]]", suggestion.value)
+            } else {
+                let start = c.ctx.start.min(text.len());
+                format!("{}{}", &text[..start], complete::insertion(&c.ctx, &suggestion.value))
+            }
+        };
+        let value = match (entry.value, c.item) {
+            (Value::Text { text, quote }, _) => Value::Text { text: write(&text), quote },
+            (Value::List { mut items, block }, Some(k)) if k < items.len() => {
+                items[k] = write(&items[k]);
+                Value::List { items, block }
+            }
+            _ => return,
+        };
+        tab.set_property(c.entry, &value);
+    }
+
+    /// Removes list item `item` of entry `entry` when it is empty. Whether it did.
+    fn drop_empty_item(&mut self, entry: usize, item: usize) -> bool {
+        use sage_editor::properties::Value;
+        let Some(tab) = self.tabs.get_mut(self.active).filter(|t| t.loaded) else { return false };
+        let Some(Value::List { mut items, block }) = tab.property(entry).map(|e| e.value) else { return false };
+        if !items.get(item).is_some_and(|i| i.trim().is_empty()) {
+            return false;
+        }
+        items.remove(item);
+        tab.set_property(entry, &Value::List { items, block });
+        true
+    }
+
+    /// Asks whether the first empty list item of the properties still has the
+    /// focus, so that one left empty is removed, as in Obsidian.
+    fn prune_check(&self) -> Task<Message> {
+        use sage_editor::properties::Value;
+        let Some(tab) = self.tabs.get(self.active).filter(|t| t.loaded) else { return Task::none() };
+        let Some(lines) = tab.frontmatter_lines() else { return Task::none() };
+        for (entry, e) in sage_editor::properties::parse(&lines).into_iter().enumerate() {
+            if let Value::List { items, .. } = e.value {
+                if let Some(item) = items.iter().position(|i| i.trim().is_empty()) {
+                    return iced::widget::operation::is_focused(iced::widget::Id::from(preview::property_id(entry, item)))
+                        .map(move |focused| Message::PropertyBlur(entry, item, focused));
+                }
+            }
+        }
+        Task::none()
+    }
+
+    /// Enter in a property field: takes the suggestion shown, else turns the
+    /// text of a link property into a link.
+    fn submit_property(&mut self, entry: usize, item: Option<usize>) {
+        use sage_editor::properties::Value;
+        if self.prop_complete.as_ref().is_some_and(|c| c.entry == entry && c.item == item) {
+            return self.accept_property(None);
+        }
+        if self.drop_empty_item(entry, item.unwrap_or(usize::MAX)) {
+            return;
+        }
+        let Some(tab) = self.tabs.get_mut(self.active).filter(|t| t.loaded) else { return };
+        let Some(current) = tab.property(entry).filter(|e| is_link_property(&e.key)) else { return };
+        let link = |text: &str| {
+            let name = text.trim();
+            let linked = name.len() >= 4 && name.starts_with("[[") && name.ends_with("]]");
+            (!name.is_empty() && !linked).then(|| format!("[[{name}]]"))
+        };
+        let value = match (current.value, item) {
+            (Value::Text { text, quote }, _) => link(&text).map(|text| Value::Text { text, quote }),
+            (Value::List { mut items, block }, Some(k)) => {
+                let linked = items.get(k).and_then(|i| link(i));
+                linked.map(|l| {
+                    items[k] = l;
+                    Value::List { items, block }
+                })
+            }
+            _ => None,
+        };
+        if let Some(value) = value {
+            tab.set_property(entry, &value);
+        }
+    }
+
     fn accept_completion(&mut self) -> Task<Message> {
         let Some(c) = self.completion.take() else { return Task::none() };
         let Some(item) = c.items.get(c.selected) else { return Task::none() };
@@ -3959,15 +4338,14 @@ impl App {
             }
             return;
         }
+        let entries = self.quick_entries();
         let Some(palette) = &mut self.palette else { return };
         palette.hits.clear();
         match &palette.mode {
             PaletteMode::Search => {}
             PaletteMode::QuickAdd => {
                 let filter = palette.query.trim().to_lowercase();
-                palette.hits = self
-                    .settings
-                    .quick_add
+                palette.hits = entries
                     .iter()
                     .enumerate()
                     .filter(|(_, entry)| entry.name().to_lowercase().contains(&filter))
@@ -4020,7 +4398,7 @@ impl App {
 
         let can_undo = !self.renames.is_empty();
         if let Some(filter) = palette.query.strip_prefix('>') {
-            palette.hits = command_hits(&filter.trim().to_lowercase(), &self.settings, can_undo);
+            palette.hits = command_hits(&filter.trim().to_lowercase(), &self.settings, &entries, can_undo);
             return;
         }
 
@@ -4074,7 +4452,7 @@ impl App {
         );
         // Commands and Quick Add entries are found by name too, without `>`.
         if query.chars().count() >= 3 {
-            palette.hits.extend(command_hits(&query.to_lowercase(), &self.settings, can_undo));
+            palette.hits.extend(command_hits(&query.to_lowercase(), &self.settings, &entries, can_undo));
         }
         if let Some(fts) = sage_db::fts_query(&query) {
             push(
@@ -4314,7 +4692,7 @@ impl App {
                     highlight::to_format,
                 )
                 .style(move |_, status| theme::editor(t, status));
-            self.with_overlay(t, editor.into())
+            self.with_overlay(t, editor.into(), false)
         };
         let live = || -> Element<'_, Message> {
             // Tables, embeds, views and the properties, drawn by the preview.
@@ -4322,24 +4700,38 @@ impl App {
             // The properties are edited in place, not drawn read-only.
             let props = tab.islands.iter().find(|i| matches!(i.blocks.first(), Some(sage_markdown::Block::Properties(_)))).map(|i| i.lines.clone());
             let inner = if props.is_some() { tab.frontmatter_lines().unwrap_or_default() } else { Vec::new() };
+            let pending = self.prop_complete.as_ref().filter(|c| c.tab == tab.path);
             let islands = tab
                 .islands
                 .iter()
                 .map(|i| {
                     let element = if props.as_ref() == Some(&i.lines) {
-                        preview::property_editor(sage_editor::properties::parse(&inner), t)
+                        let popup = pending.map(|c| (c.entry, suggestion_list(t, c.ctx.kind, &c.items, c.selected, Message::PropertyPick)));
+                        let types = sage_editor::properties::parse(&inner)
+                            .into_iter()
+                            .map(|e| {
+                                let chosen = self.chosen_type(&e.key);
+                                let ty = sage_editor::properties::type_of(&e.value, chosen);
+                                (e, ty)
+                            })
+                            .collect();
+                        let editing = self.editing_prop.as_ref().filter(|(p, _)| *p == tab.path).map(|(_, e)| *e);
+                        preview::property_editor(types, popup, self.type_menu, self.chip_hover, editing, &self.new_property, t)
                     } else {
                         preview::blocks(&i.blocks, ctx)
                     };
                     (i.lines.clone(), element)
                 })
                 .collect();
+            let popup = self.completion.as_ref().map(|c| self.completion_popup(t, c));
             self.with_overlay(
                 t,
                 live_editor::LiveEditor::new(&tab.content, EDITOR, t, self.find_mark(), Message::Live, key_binding)
                     .islands(islands)
                     .editable(props)
+                    .popup(popup)
                     .into(),
+                true,
             )
         };
 
@@ -4400,15 +4792,16 @@ impl App {
     /// The editor always sits in the same two-layer stack. Swapping it
     /// between a bare editor and a stack changes the widget tree, and iced
     /// would drop the editor's state, focus included. The find bar floats at
-    /// the top right, the completion popup at the bottom.
-    fn with_overlay<'a>(&'a self, t: Tokens, editor: Element<'a, Message>) -> Element<'a, Message> {
+    /// the top right, the completion popup at the bottom unless the editor
+    /// draws it at its caret (`at_caret`).
+    fn with_overlay<'a>(&'a self, t: Tokens, editor: Element<'a, Message>, at_caret: bool) -> Element<'a, Message> {
         let find: Element<'_, Message> = match &self.find {
             Some(find) => container(self.find_bar(t, find)).width(Fill).align_right(Fill).into(),
             None => space().into(),
         };
         let popup: Element<'_, Message> = match &self.completion {
-            Some(completion) => self.completion_popup(t, completion),
-            None => space().into(),
+            Some(completion) if !at_caret => self.completion_popup(t, completion),
+            _ => space().into(),
         };
         let overlay = column![find, space().height(Fill), popup].padding(16);
         stack![editor, overlay].into()
@@ -4416,50 +4809,10 @@ impl App {
 
     /// Anchored to the bottom of the source pane. iced does not expose the
     /// editor's scroll offset, so placing it at the caret would drift once the
-    /// note scrolls; a fixed anchor is always correct.
+    /// note scrolls; a fixed anchor is always correct. Live preview knows its
+    /// caret and puts the same list under it.
     fn completion_popup<'a>(&'a self, t: Tokens, completion: &'a Completion) -> Element<'a, Message> {
-        let heading = match completion.ctx.kind {
-            complete::Kind::Link => "Link to note",
-            complete::Kind::Embed => "Embed",
-            complete::Kind::Tag => "Tag",
-            complete::Kind::Path => "Path",
-        };
-        let mut list = Column::new().spacing(1);
-        for (i, item) in completion.items.iter().enumerate() {
-            let selected = i == completion.selected;
-            list = list.push(
-                button(
-                    row![
-                        container(space()).width(2).height(18).style(move |_| theme::accent_rule(t, selected)),
-                        text(&item.label).size(14).wrapping(text::Wrapping::None),
-                        space().width(Fill),
-                        text(&item.detail).size(12).color(t.text_2).wrapping(text::Wrapping::None),
-                    ]
-                    .spacing(10)
-                    .align_y(iced::Center),
-                )
-                .width(Fill)
-                .padding([4, 8])
-                .style(move |_, status| theme::nav_button(t, selected, status))
-                .on_press(Message::CompletePick(i)),
-            );
-        }
-        container(
-            column![
-                row![
-                    text(heading).size(12).font(theme::SANS_BOLD).color(t.text_2),
-                    space().width(Fill),
-                    text("↑↓ select · Enter accept · Esc close").size(12).color(t.text_2),
-                ]
-                .padding([2, 8]),
-                list,
-            ]
-            .spacing(4),
-        )
-        .padding(6)
-        .max_width(560)
-        .style(move |_| theme::panel(t))
-        .into()
+        suggestion_list(t, completion.ctx.kind, &completion.items, completion.selected, Message::CompletePick)
     }
 
     /// A merge waiting for choices, in place of the editor: each section both
@@ -4818,7 +5171,7 @@ impl App {
             PaletteMode::QuickAdd => "Quick add".to_owned(),
             PaletteMode::Everywhere(_) => "Search everywhere".to_owned(),
             PaletteMode::NewFolder => "Name of the new folder, with / for folders in folders".to_owned(),
-            PaletteMode::QuickAddValue(i) => match self.settings.quick_add.get(i) {
+            PaletteMode::QuickAddValue(i) => match self.quick_entries().get(i) {
                 Some(QuickAdd::Capture { name, .. }) => format!("{name}: what to add"),
                 Some(entry) => format!("{}: name of the new note", entry.name()),
                 None => String::new(),
@@ -5108,14 +5461,13 @@ fn folder_hits(from: &str, query: &str, files: &[FileRow]) -> Vec<Hit> {
 }
 
 /// Commands and Quick Add entries whose name contains `filter`, in lowercase.
-fn command_hits(filter: &str, settings: &sage_editor::settings::Settings, can_undo: bool) -> Vec<Hit> {
+fn command_hits(filter: &str, settings: &sage_editor::settings::Settings, entries: &[QuickAdd], can_undo: bool) -> Vec<Hit> {
     let commands = COMMANDS
         .iter()
         .filter(|(name, ..)| name.to_lowercase().contains(filter))
         .filter(|(.., command)| can_undo || *command != Command::UndoRename)
         .map(|&(name, command)| Hit { label: name.into(), detail: keys(command, settings), action: HitAction::Run(command) });
-    let entries = settings
-        .quick_add
+    let entries = entries
         .iter()
         .enumerate()
         .filter(|(_, entry)| format!("quick add: {}", entry.name().to_lowercase()).contains(filter))
@@ -5208,6 +5560,58 @@ fn template_hits(config: &TemplateConfig, query: &str, files: &[FileRow]) -> Vec
             action: HitAction::InsertTemplate(f.path.clone()),
         })
         .collect()
+}
+
+/// The suggestions as a list in a panel; `pick` makes the message for a row.
+fn suggestion_list<'a>(
+    t: Tokens,
+    kind: complete::Kind,
+    items: &'a [Suggestion],
+    selected: usize,
+    pick: fn(usize) -> Message,
+) -> Element<'a, Message> {
+    let heading = match kind {
+        complete::Kind::Link => "Link to note",
+        complete::Kind::Embed => "Embed",
+        complete::Kind::Tag => "Tag",
+        complete::Kind::Path => "Path",
+    };
+    let mut list = Column::new().spacing(1);
+    for (i, item) in items.iter().enumerate() {
+        let current = i == selected;
+        list = list.push(
+            button(
+                row![
+                    container(space()).width(2).height(18).style(move |_| theme::accent_rule(t, current)),
+                    text(&item.label).size(14).wrapping(text::Wrapping::None),
+                    space().width(Fill),
+                    text(&item.detail).size(12).color(t.text_2).wrapping(text::Wrapping::None),
+                ]
+                .spacing(10)
+                .align_y(iced::Center),
+            )
+            .width(Fill)
+            .padding([4, 8])
+            .style(move |_, status| theme::nav_button(t, current, status))
+            .on_press(pick(i)),
+        );
+    }
+    container(
+        column![
+            row![
+                text(heading).size(12).font(theme::SANS_BOLD).color(t.text_2),
+                space().width(Fill),
+                text("↑↓ select · Enter accept · Esc close").size(12).color(t.text_2),
+            ]
+            .padding([2, 8]),
+            list,
+        ]
+        .spacing(4),
+    )
+    .padding(6)
+    .max_width(560)
+    .style(move |_| theme::panel(t))
+    .into()
 }
 
 /// Puts the editor's cursor, and its selection if `cursor` has one. iced's

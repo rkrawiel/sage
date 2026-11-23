@@ -13,12 +13,20 @@ use std::path::{Path, PathBuf};
 pub struct Settings {
     /// Vault-relative folder of templates. `None` uses Obsidian's setting.
     pub templates_folder: Option<String>,
+    /// Vault path of the template Ctrl+N starts a new note from. `None`
+    /// makes an empty note.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_note_template: Option<String>,
     pub quick_add: Vec<QuickAdd>,
     /// Sage's own shortcuts rebound: command name to keys, such as
     /// `"New note": "Ctrl+Alt+Shift+N"`; empty keys take the shortcut away.
     /// Commands not named keep their usual keys.
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub shortcuts: std::collections::BTreeMap<String, String>,
+    /// The type chosen for each property name, lowercase, such as
+    /// `"due": "date"`. Obsidian's own `types.json` is read as well; these win.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub property_types: std::collections::BTreeMap<String, String>,
 }
 
 impl Settings {
