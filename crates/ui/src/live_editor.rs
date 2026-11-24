@@ -43,6 +43,8 @@ pub enum Event {
     Place(Cursor),
     /// Follow a link, given as written, such as `[[Note|alias]]`.
     Follow(String),
+    /// Ctrl+click on text: follow the link under the pointer, if any.
+    CtrlClick(Position),
     /// Check or uncheck the task on this line.
     Toggle(usize),
 }
@@ -218,6 +220,9 @@ fn lay(text: String, line: Line, width: f32, t: Tokens) -> Laid {
             font = theme::MONO;
         }
         let color = if s.syntax || s.tag || matches!(piece.show, Show::Replace(_)) && !line.title {
+            t.text_2
+        } else if s.link && s.missing {
+            // A link to a note that does not exist yet recedes, underlined by its colour alone.
             t.text_2
         } else if s.link {
             t.accent
@@ -648,6 +653,11 @@ impl<Message> Widget<Message, Theme, Renderer> for LiveEditor<'_, Message> {
                 match (click.kind(), hit) {
                     (mouse::click::Kind::Single, Hit::Text(p)) if state.modifiers.shift() => {
                         shell.publish(place(p, Some(anchor)));
+                    }
+                    // Ctrl+click follows a link whose syntax is showing, as the cursor is on it.
+                    (mouse::click::Kind::Single, Hit::Text(p)) if state.modifiers.command() => {
+                        shell.publish(place(p, None));
+                        shell.publish(on(Event::CtrlClick(p)));
                     }
                     (mouse::click::Kind::Single, Hit::Checkbox(line)) => shell.publish(on(Event::Toggle(line))),
                     (mouse::click::Kind::Single, Hit::Link(line, range)) => {

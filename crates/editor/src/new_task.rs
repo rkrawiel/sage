@@ -34,7 +34,7 @@ fn clean_title(title: &str) -> Result<String, String> {
 
 /// A checkbox line as the Tasks plugin writes it: `- [ ] Title 📅 2026-11-30`.
 pub fn task_line(title: &str, due: Option<&str>) -> Result<String, String> {
-    let mut line = format!("- [ ] {}", clean_title(title)?);
+    let mut line = format!("- [ ] {} #task", clean_title(title)?);
     if let Some(due) = due {
         line.push_str(" 📅 ");
         line.push_str(due);
@@ -110,8 +110,8 @@ mod tests {
         assert_eq!(parse_due("Tomorrow", today), Ok(Some("2026-11-17".into())));
         assert_eq!(parse_due("2026-11-30", today), Ok(Some("2026-11-30".into())));
         assert!(parse_due("next week", today).unwrap_err().contains("not a date"));
-        assert_eq!(task_line("  Fix   voice\nbug ", Some("2026-11-30")).unwrap(), "- [ ] Fix voice bug 📅 2026-11-30");
-        assert_eq!(task_line("Call", None).unwrap(), "- [ ] Call");
+        assert_eq!(task_line("  Fix   voice\nbug ", Some("2026-11-30")).unwrap(), "- [ ] Fix voice bug #task 📅 2026-11-30");
+        assert_eq!(task_line("Call", None).unwrap(), "- [ ] Call #task");
         assert!(task_line(" ", None).is_err());
 
         // The line is a task with that due date to the scanner.

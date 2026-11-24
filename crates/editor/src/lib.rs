@@ -6,6 +6,7 @@
 
 pub mod chord;
 pub mod complete;
+pub mod dates;
 pub mod edit;
 pub mod find;
 pub mod merge;

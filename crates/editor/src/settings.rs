@@ -17,7 +17,19 @@ pub struct Settings {
     /// makes an empty note.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new_note_template: Option<String>,
+    /// Vault path of a note that opens whenever Sage starts on this vault.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub startup_note: Option<String>,
     pub quick_add: Vec<QuickAdd>,
+    /// Whether every note in the templates folder is also a Quick Add entry;
+    /// `None`, the default, means yes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quick_add_templates: Option<bool>,
+    /// Whether only checkboxes marked as tasks (`#task`, `#followup` or a due
+    /// date) are followed in the task list and in queries; the rest stay
+    /// plain checklists.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub tracked_tasks_only: bool,
     /// Sage's own shortcuts rebound: command name to keys, such as
     /// `"New note": "Ctrl+Alt+Shift+N"`; empty keys take the shortcut away.
     /// Commands not named keep their usual keys.

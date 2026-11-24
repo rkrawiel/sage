@@ -56,6 +56,12 @@ use theme::Tokens;
 const PALETTE_INPUT: &str = "palette-input";
 const FIND_INPUT: &str = "find-input";
 const EDITOR: &str = "source-editor";
+const TABS: &str = "tab-bar";
+
+/// The pointer and window as last seen, kept off the message queue so that
+/// moving the mouse does not redraw the window. A context menu opens here.
+static POINTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static WINDOW_HEIGHT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 /// The window's size when it opens.
 const WINDOW_SIZE: (f32, f32) = (1280.0, 820.0);
 /// The width of a divider between panes: the hairline and room to grab it.
@@ -213,6 +219,8 @@ enum Message {
     ToggleSettings,
     SettingsTemplatesFolder(settings::Pick),
     SettingsNewNoteTemplate(settings::Pick),
+    SettingsStartupNote(Option<String>),
+    SettingsQuickAddTemplates(bool),
     QuickAddEdit(usize, settings::Field),
     /// A new Quick Add entry: a capture entry, or a template entry.
     QuickAddNew(bool),
@@ -255,6 +263,25 @@ enum Message {
     TemplateLoaded { target: String, config: TemplateConfig, result: Result<String, String> },
     SelectTab(usize),
     CloseTab(usize),
+    TabMenu(usize),
+    CloseOtherTabs(usize),
+    CloseTabsRight(usize),
+    /// Runs a command from a button.
+    Run(Command),
+    /// Moves a tab one place left (-1) or right (1).
+    MoveTab(usize, isize),
+    PinTab(usize),
+    /// The toast's Undo button: moves a note back out of `.trash`.
+    UndoTrash,
+    TrashUndone(Result<String, String>),
+    DismissToast,
+    TaskFilter(tasks::Filter),
+    ShortcutFilter(String),
+    SettingsTrackedOnly(bool),
+    /// Once a second while a toast shows, so it goes away by itself.
+    ToastTick,
+    CloseAllTabs,
+    CloseMenu,
     ToggleFolder(String),
     Edit(text_editor::Action),
     /// A key the editors handle themselves: formatting, lists, lines, pairs.
@@ -292,8 +319,14 @@ enum Message {
     ChipHover(Option<(usize, usize)>),
     /// Search everywhere for a tag, from a tag pill.
     SearchTag(String),
+    /// The Today button of a date property: today's date, or in a template a placeholder for it.
+    PropertyToday(usize),
     /// Starts (`Some`) or ends editing the pills of property entry `n`.
     PropertyEdit(Option<usize>),
+    NewPropertyOpen,
+    NewPropertyType(sage_editor::properties::PropType),
+    /// Whether the new property's name field still has the focus.
+    NewPropertyBlur(bool),
     NewPropertyTyped(String),
     NewPropertySubmit,
     /// Whether an empty list item still has the focus; once it has not, it goes.
@@ -403,6 +436,8 @@ enum Command {
     InsertTemplate,
     ToggleTasks,
     NewInlineTask,
+    /// Makes the line a task and offers the people to follow up with.
+    FollowUp,
     NewTaskNote,
     QuickAdd,
     ToggleSettings,
@@ -417,10 +452,13 @@ enum Command {
     ZoomIn,
     ZoomOut,
     ZoomReset,
+    /// The list of keyboard shortcuts and tricks.
+    Shortcuts,
 }
 
 /// The commands the palette offers, by name.
-const COMMANDS: [(&str, Command); 33] = [
+const COMMANDS: [(&str, Command); 35] = [
+    ("Keyboard shortcuts", Command::Shortcuts),
     ("Save note", Command::Save),
     ("Search everywhere", Command::SearchEverywhere),
     ("New note", Command::NewNote),
@@ -431,6 +469,7 @@ const COMMANDS: [(&str, Command); 33] = [
     ("Insert template", Command::InsertTemplate),
     ("Show tasks", Command::ToggleTasks),
     ("New task line", Command::NewInlineTask),
+    ("Follow up with a person", Command::FollowUp),
     ("New task note", Command::NewTaskNote),
     ("Quick add", Command::QuickAdd),
     ("Settings", Command::ToggleSettings),
@@ -458,7 +497,8 @@ const COMMANDS: [(&str, Command); 33] = [
 
 /// Sage's own shortcuts: what the keyboard runs, what the palette shows
 /// beside each command, and what the shortcuts settings list.
-const BUILT_IN: [(&str, Command); 20] = [
+const BUILT_IN: [(&str, Command); 22] = [
+    ("F1", Command::Shortcuts),
     ("Ctrl+P", Command::TogglePalette),
     ("Ctrl+Shift+F", Command::SearchEverywhere),
     ("Ctrl+S", Command::Save),
@@ -467,6 +507,7 @@ const BUILT_IN: [(&str, Command); 20] = [
     ("Ctrl+F", Command::Find),
     ("Ctrl+T", Command::NewTaskNote),
     ("Ctrl+Shift+T", Command::NewInlineTask),
+    ("Ctrl+Shift+J", Command::FollowUp),
     ("Ctrl+E", Command::CycleView),
     ("Ctrl+Shift+E", Command::ToggleLive),
     ("Ctrl+W", Command::CloseActiveTab),
@@ -580,6 +621,8 @@ struct Session {
     tree_order: tree::Order,
     /// Notes opened lately, newest first, for the palette.
     recent: Vec<String>,
+    /// Notes whose tabs are pinned.
+    pinned: Vec<String>,
     /// The sidebar shows the note's outline instead of the tree.
     outline: bool,
     /// The interface's size, 1.0 as designed.
@@ -617,6 +660,15 @@ struct Doomed {
     folder: bool,
 }
 
+/// A short message over the page. `undo` is where a trashed note came from and went to.
+struct Toast {
+    text: String,
+    undo: Option<(String, String)>,
+    until: Instant,
+}
+
+const TOAST_FOR: Duration = Duration::from_secs(6);
+
 struct App {
     vault: PathBuf,
     db_path: PathBuf,
@@ -649,7 +701,7 @@ struct App {
     /// Suggestions under a field of the properties widget.
     prop_complete: Option<PropCompletion>,
     /// The name being typed for a new property.
-    new_property: String,
+    new_property: Option<(sage_editor::properties::PropType, String)>,
     /// The property whose list of types is open.
     type_menu: Option<usize>,
     chip_hover: Option<(usize, usize)>,
@@ -677,9 +729,25 @@ struct App {
     /// The window's width, which the dividers share out.
     window_width: f32,
     /// The tree item whose menu is open: its path, and whether it is a folder.
+    /// A tab's menu sets this to the tab's note as well.
     menu: Option<(String, bool)>,
+    /// Where the open menu was asked for, and the tab it belongs to, if any.
+    menu_at: iced::Point,
+    tab_menu: Option<usize>,
+    /// The current tab and the tab count the tab bar was last scrolled for.
+    tabs_shown: (usize, usize),
+    /// Whether the start-up note has been dealt with.
+    startup_done: bool,
     /// A deletion waiting for the user to confirm it.
     doomed: Option<Doomed>,
+    /// The list of shortcuts, while it is open.
+    help: bool,
+    /// The settings panel's shortcut search.
+    shortcut_filter: String,
+    /// A message floating over the page for a few seconds, with Undo when it can.
+    toast: Option<Toast>,
+    /// Notes whose tabs stay at the left and ignore Close others and Close all.
+    pinned: Vec<String>,
     /// The new-task form, while it is open.
     task_form: Option<task_form::TaskForm>,
     /// The Quick Add entry whose shortcut is being recorded: the next chord is it.
@@ -836,6 +904,8 @@ struct Tab {
     /// once the tab is shown.
     links_stale: bool,
     backlinks: Vec<(String, String)>,
+    /// Open `#followup` tasks elsewhere in the vault that link to this note.
+    followups: Vec<tasks::TaskRow>,
     outgoing: Vec<Outgoing>,
     /// Where the cursor goes once the first read finishes.
     jump: Option<Jump>,
@@ -881,6 +951,7 @@ impl Tab {
             parsed_at: Instant::now(),
             links_stale: false,
             backlinks: Vec::new(),
+            followups: Vec::new(),
             outgoing: Vec::new(),
             jump: None,
             disk_stamp: None,
@@ -1313,6 +1384,8 @@ enum PaletteMode {
     QuickAdd,
     /// The query is the value for the Quick Add entry with this index.
     QuickAddValue(usize),
+    /// The query is the name of a note to create.
+    NewNote,
     /// The query is the path of a folder to create.
     NewFolder,
     /// Fuzzy search over every note's metadata and text, read off the UI
@@ -1370,7 +1443,7 @@ impl App {
             palette: None,
             completion: None,
             prop_complete: None,
-            new_property: String::new(),
+            new_property: None,
             type_menu: None,
             chip_hover: None,
             editing_prop: None,
@@ -1388,7 +1461,15 @@ impl App {
             resizing: None,
             window_width: WINDOW_SIZE.0,
             menu: None,
+            menu_at: iced::Point::ORIGIN,
+            tab_menu: None,
+            tabs_shown: (usize::MAX, 0),
+            startup_done: false,
             doomed: None,
+            help: false,
+            shortcut_filter: String::new(),
+            toast: None,
+            pinned: session.pinned.clone(),
             task_form: None,
             recording: None,
             recording_built_in: None,
@@ -1467,11 +1548,15 @@ impl App {
             iced::event::listen_with(mouse_up),
             iced::event::listen_with(window_focus),
             iced::event::listen_with(window_width),
+            iced::event::listen_with(track_pointer),
             iced::event::listen_with(side_buttons),
             iced::event::listen_with(file_dropped),
             iced::window::close_requests().map(|_| Message::CloseRequested),
             iced::time::every(Duration::from_secs(60)).map(|_| Message::Clock),
         ];
+        if self.toast.is_some() {
+            subscriptions.push(iced::time::every(Duration::from_secs(1)).map(|_| Message::ToastTick));
+        }
         if self.settling {
             subscriptions.push(iced::time::every(Duration::from_millis(100)).map(|_| Message::Settle));
         }
@@ -1493,7 +1578,25 @@ impl App {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         let task = self.handle(message);
-        Task::batch([task, self.sync_previews()])
+        Task::batch([task, self.sync_previews(), self.show_current_tab()])
+    }
+
+    /// Scrolls the tab bar so the current tab is in view, when the current
+    /// tab or the number of tabs changed. Tab widths are estimated from their
+    /// titles, as the bar's content size is not known here.
+    fn show_current_tab(&mut self) -> Task<Message> {
+        let now = (self.active, self.tabs.len());
+        if now == self.tabs_shown || self.tabs.is_empty() {
+            return Task::none();
+        }
+        self.tabs_shown = now;
+        let width = |tab: &Tab| tab.title.chars().count() as f32 * 7.5 + 70.0;
+        let start: f32 = self.tabs.iter().take(self.active).map(width).sum();
+        let own = self.tabs.get(self.active).map_or(0.0, width);
+        let sidebar = if self.focus { 0.0 } else { self.sidebar_width() + DIVIDER };
+        let room = (self.window_width - sidebar).max(100.0);
+        let x = (start + own / 2.0 - room / 2.0).max(0.0);
+        iced::widget::operation::scroll_to(TABS, iced::widget::operation::AbsoluteOffset { x: Some(x), y: None })
     }
 
     fn handle(&mut self, message: Message) -> Task<Message> {
@@ -1563,6 +1666,10 @@ impl App {
                 self.folds.retain(|p, _| !gone(p));
                 self.find = None;
                 self.notice(format!("Moved {path} to {target}"));
+                if let Some(toast) = &mut self.toast {
+                    toast.text = format!("Moved {path} to .trash");
+                    toast.undo = Some((path.clone(), target.clone()));
+                }
                 self.persist();
             }
             Message::Trashed(path, Err(error)) => self.notice(format!("Could not move {path}: {error}")),
@@ -1571,6 +1678,8 @@ impl App {
             Message::RenameUndone(Ok((rename, restored))) => self.on_rename_undone(rename, restored),
             Message::RenameUndone(Err(error)) => self.notice(format!("Could not undo the rename: {error}")),
             Message::TreeMenu(path, folder) => {
+                self.tab_menu = None;
+                self.menu_at = pointer();
                 self.menu = Some((path, folder)).filter(|item| self.menu.as_ref() != Some(item));
             }
             Message::TreeNewNote => return self.run(Command::NewNote),
@@ -1633,7 +1742,16 @@ impl App {
                     self.persist();
                 }
             }
-            Message::SettingsLoaded(Ok(settings)) => self.settings = settings,
+            Message::SettingsLoaded(Ok(settings)) => {
+                self.settings = settings;
+                self.apply_tracking();
+                // Only the first read, as Sage starts, opens the note.
+                if !std::mem::replace(&mut self.startup_done, true) {
+                    if let Some(path) = self.settings.startup_note.clone().filter(|p| self.files.iter().any(|f| f.path == *p)) {
+                        return self.open(path);
+                    }
+                }
+            }
             Message::SettingsLoaded(Err(error)) => {
                 self.notice(format!("Sage's settings were not read, and will not be saved: {error}"));
                 self.settings_error = Some(error);
@@ -1658,6 +1776,19 @@ impl App {
             }
             Message::SettingsNewNoteTemplate(pick) => {
                 self.settings.new_note_template = (!pick.value.is_empty()).then_some(pick.value);
+                self.settings_edited();
+            }
+            Message::SettingsStartupNote(path) => {
+                self.settings.startup_note = path;
+                self.settings_edited();
+            }
+            Message::SettingsTrackedOnly(on) => {
+                self.settings.tracked_tasks_only = on;
+                self.apply_tracking();
+                self.settings_edited();
+            }
+            Message::SettingsQuickAddTemplates(on) => {
+                self.settings.quick_add_templates = Some(on);
                 self.settings_edited();
             }
             Message::QuickAddEdit(i, field) => {
@@ -1858,6 +1989,89 @@ impl App {
                 self.persist();
             }
             Message::CloseTab(i) => self.close_tab(i),
+            Message::TabMenu(i) => {
+                if let Some(tab) = self.tabs.get(i) {
+                    self.menu = Some((tab.path.clone(), false));
+                    self.tab_menu = Some(i);
+                    self.menu_at = pointer();
+                }
+            }
+            Message::CloseOtherTabs(i) => self.close_tabs(|j| j != i),
+            Message::CloseTabsRight(i) => self.close_tabs(|j| j > i),
+            Message::CloseAllTabs => self.close_tabs(|_| true),
+            Message::MoveTab(i, by) => {
+                self.menu = None;
+                self.tab_menu = None;
+                let j = i as isize + by;
+                if i < self.tabs.len() && j >= 0 && (j as usize) < self.tabs.len() {
+                    let current = self.tabs[self.active].path.clone();
+                    self.tabs.swap(i, j as usize);
+                    self.active = self.tabs.iter().position(|t| t.path == current).unwrap_or(0);
+                    self.persist();
+                }
+            }
+            Message::PinTab(i) => {
+                self.menu = None;
+                self.tab_menu = None;
+                if let Some(path) = self.tabs.get(i).map(|t| t.path.clone()) {
+                    if let Some(at) = self.pinned.iter().position(|p| *p == path) {
+                        self.pinned.remove(at);
+                    } else {
+                        // Pinned tabs gather at the left.
+                        let current = self.tabs[self.active].path.clone();
+                        let tab = self.tabs.remove(i);
+                        let to = self.tabs.iter().take_while(|t| self.pinned.contains(&t.path)).count();
+                        self.tabs.insert(to, tab);
+                        self.active = self.tabs.iter().position(|t| t.path == current).unwrap_or(0);
+                        self.pinned.push(path);
+                    }
+                    self.persist();
+                }
+            }
+            Message::ToastTick => {
+                if self.toast.as_ref().is_some_and(|t| Instant::now() >= t.until) {
+                    self.toast = None;
+                }
+            }
+            Message::DismissToast => self.toast = None,
+            Message::ShortcutFilter(filter) => self.shortcut_filter = filter,
+            Message::TaskFilter(filter) => {
+                if let Some(list) = &mut self.tasks {
+                    list.filter = filter;
+                }
+            }
+            Message::UndoTrash => {
+                if let Some((from, target)) = self.toast.take().and_then(|t| t.undo) {
+                    let vault = self.vault.clone();
+                    return Task::perform(
+                        async move {
+                            tokio::task::spawn_blocking(move || {
+                                let to = vault.join(&from);
+                                if to.exists() {
+                                    return Err(format!("{from} exists again"));
+                                }
+                                if let Some(parent) = to.parent() {
+                                    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                                }
+                                std::fs::rename(vault.join(&target), &to).map_err(|e| e.to_string())?;
+                                Ok(from)
+                            })
+                            .await
+                            .unwrap_or_else(|e| Err(e.to_string()))
+                        },
+                        Message::TrashUndone,
+                    );
+                }
+            }
+            Message::TrashUndone(Ok(path)) => {
+                self.notice(format!("Restored {path}"));
+                return self.open(path);
+            }
+            Message::TrashUndone(Err(error)) => self.notice(format!("Could not restore: {error}")),
+            Message::CloseMenu => {
+                self.menu = None;
+                self.tab_menu = None;
+            }
             Message::ToggleFolder(path) => {
                 self.menu = None;
                 if !self.expanded.remove(&path) {
@@ -1866,6 +2080,8 @@ impl App {
                 self.persist();
             }
             Message::Edit(action) => {
+                // Ctrl+click follows the link under the pointer, as in Obsidian.
+                let ctrl_click = matches!(action, text_editor::Action::Click(_)) && self.modifiers.command();
                 match action {
                     text_editor::Action::Click(_) => self.left_down = true,
                     text_editor::Action::Drag(_) if !self.left_down => return Task::none(),
@@ -1886,6 +2102,13 @@ impl App {
                     tab.history.break_group();
                 }
                 tab.content.perform(action);
+                if ctrl_click {
+                    let at = tab.content.cursor().position;
+                    let link = tab.content.line(at.line).and_then(|line| wikilink_at(&line.text, at.column).and_then(link_target));
+                    if let Some(link) = link {
+                        return self.follow(link);
+                    }
+                }
                 if is_edit {
                     tab.mark_edited();
                     self.refresh_completion();
@@ -1933,6 +2156,16 @@ impl App {
                     self.dismissed = None;
                     self.prop_complete = None;
                 }
+                live_editor::Event::CtrlClick(position) => {
+                    let link = self
+                        .tabs
+                        .get(self.active)
+                        .and_then(|tab| tab.content.line(position.line))
+                        .and_then(|line| wikilink_at(&line.text, position.column).and_then(link_target));
+                    if let Some(link) = link {
+                        return self.follow(link);
+                    }
+                }
                 live_editor::Event::Follow(source) => {
                     if let Some(link) = link_target(&source) {
                         return self.follow(link);
@@ -1959,12 +2192,46 @@ impl App {
                     return self.prune_check();
                 }
             }
-            Message::NewPropertyTyped(s) => self.new_property = s,
+            Message::NewPropertyOpen => {
+                self.new_property = Some((sage_editor::properties::PropType::Text, String::new()));
+                return iced::widget::operation::focus(iced::widget::Id::from(preview::NEW_PROPERTY));
+            }
+            Message::NewPropertyType(ty) => {
+                if let Some((current, _)) = &mut self.new_property {
+                    *current = ty;
+                }
+                return iced::widget::operation::focus(iced::widget::Id::from(preview::NEW_PROPERTY));
+            }
+            Message::NewPropertyBlur(focused) => {
+                if !focused && self.new_property.as_ref().is_some_and(|(_, s)| s.trim().is_empty()) {
+                    self.new_property = None;
+                }
+            }
+            Message::NewPropertyTyped(s) => {
+                if let Some((_, name)) = &mut self.new_property {
+                    *name = s;
+                }
+            }
             Message::NewPropertySubmit => {
-                let key = std::mem::take(&mut self.new_property).trim().to_owned();
+                let Some((ty, name)) = self.new_property.clone() else { return Task::none() };
+                let key = name.trim().to_owned();
+                // Left empty, it closes without adding anything.
+                if key.is_empty() {
+                    self.new_property = None;
+                    return Task::none();
+                }
                 let Some(tab) = self.tabs.get_mut(self.active).filter(|t| t.loaded) else { return Task::none() };
                 if let Some(entry) = tab.add_property(&key) {
-                    self.editing_prop = Some((tab.path.clone(), entry));
+                    self.new_property = None;
+                    // The name's own kind (tags, links) stays a list; otherwise the chosen type applies.
+                    if let Some(current) = tab.property(entry).filter(|e| !matches!(e.value, sage_editor::properties::Value::List { .. })) {
+                        let value = sage_editor::properties::convert(&current.value, ty);
+                        tab.set_property(entry, &value);
+                    }
+                    let path = tab.path.clone();
+                    self.settings.property_types.insert(key.to_lowercase(), ty.id().to_owned());
+                    self.settings_edited();
+                    self.editing_prop = Some((path, entry));
                     return iced::widget::operation::focus(iced::widget::Id::from(preview::property_id(entry, 0)));
                 }
             }
@@ -1978,6 +2245,23 @@ impl App {
                 }
                 self.search();
                 return open;
+            }
+            Message::PropertyToday(entry) => {
+                self.prop_complete = None;
+                let template = self.tabs.get(self.active).is_some_and(|t| t.path.starts_with(&format!("{}/", self.template_config().folder)));
+                let Some(current) = self.tabs.get(self.active).filter(|t| t.loaded).and_then(|t| t.property(entry)) else { return Task::none() };
+                let chosen = self.chosen_type(&current.key);
+                let date_time = sage_editor::properties::type_of(&current.value, chosen) == Some(sage_editor::properties::PropType::DateTime);
+                let now = sage_editor::now();
+                let text = match (template, date_time) {
+                    (true, false) => "{{date:YYYY-MM-DD}}".to_owned(),
+                    (true, true) => "{{date:YYYY-MM-DD}}T{{time:HH:mm}}".to_owned(),
+                    (false, false) => now.format("%Y-%m-%d").to_string(),
+                    (false, true) => now.format("%Y-%m-%dT%H:%M").to_string(),
+                };
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    tab.set_property(entry, &sage_editor::properties::Value::Text { text, quote: None });
+                }
             }
             Message::PropertyEdit(None) => {
                 self.editing_prop = None;
@@ -2034,6 +2318,7 @@ impl App {
             }
             // Keys for the suggestions under a property field, which has the focus.
             Message::Key(Shortcut::Escape) if self.prop_complete.is_some() => self.prop_complete = None,
+            Message::Key(Shortcut::Escape) if self.new_property.is_some() && self.palette.is_none() => self.new_property = None,
             Message::Key(Shortcut::Escape) if self.editing_prop.is_some() && self.palette.is_none() => {
                 self.editing_prop = None;
                 return self.prune_check();
@@ -2099,7 +2384,7 @@ impl App {
                 match (action, palette.mode) {
                     (Some(HitAction::Open(path)), _) => return self.open(path),
                     (Some(HitAction::OpenAt(path, line)), _) => return self.open_at(path, Some(Jump::Line(line))),
-                    (Some(HitAction::Create(name)), _) => return self.create(Some(&name)),
+                    (Some(HitAction::Create(name)), mode) => return self.create(Some(&name), matches!(mode, PaletteMode::NewNote)),
                     (Some(HitAction::CreateFolder(folder)), _) => return self.create_folder(folder),
                     (Some(HitAction::Run(command)), _) => return self.run(command),
                     (Some(HitAction::Rename(to)), PaletteMode::Rename(from)) => {
@@ -2119,7 +2404,7 @@ impl App {
                     _ => {}
                 }
             }
-            Message::Key(Shortcut::Command(command)) => return self.run(command),
+            Message::Key(Shortcut::Command(command)) | Message::Run(command) => return self.run(command),
             Message::Key(Shortcut::Escape) => {
                 // One thing closes per press: a confirmation, the tree menu,
                 // the palette, else the find bar, else the task list.
@@ -2127,6 +2412,7 @@ impl App {
                     || self.recording.take().is_some()
                     || self.recording_built_in.take().is_some()
                     || self.doomed.take().is_some()
+                    || std::mem::take(&mut self.help)
                     || self.menu.take().is_some()
                 {
                     return Task::none();
@@ -2237,7 +2523,10 @@ impl App {
         match command {
             Command::Save => return self.save(self.active, false),
             Command::ForceSave => return self.save(self.active, true),
-            Command::NewNote => return self.create(None),
+            Command::NewNote => {
+                self.palette = Some(Palette { mode: PaletteMode::NewNote, ..Palette::default() });
+                return iced::widget::operation::focus(PALETTE_INPUT);
+            }
             Command::DeleteNote => match self.tabs.get(self.active).filter(|t| t.loaded) {
                 Some(tab) => self.ask_delete(tab.path.clone(), false),
                 None => self.notice("Open the note to delete, or right-click it in the tree".into()),
@@ -2256,6 +2545,7 @@ impl App {
                 return self.set_view(next);
             }
             Command::View(mode) => return self.set_view(mode),
+            Command::Shortcuts => self.help = !self.help,
             Command::ToggleTheme => {
                 self.dark_override = Some(!self.dark());
                 self.persist();
@@ -2280,6 +2570,28 @@ impl App {
             Command::ToggleSettings => return self.handle(Message::ToggleSettings),
             Command::OpenVault => return self.open_vault(),
             Command::NewInlineTask => return self.open_task_form(false),
+            Command::FollowUp => {
+                if self.settings_open || self.tasks.is_some() || self.view_mode == ViewMode::Preview {
+                    return Task::none();
+                }
+                let Some(tab) = self.tabs.get_mut(self.active).filter(|t| t.loaded) else { return Task::none() };
+                let line = tab.content.cursor().position.line;
+                let Some(old) = tab.content.line(line).map(|l| l.text.into_owned()) else { return Task::none() };
+                let rest = old.trim_start();
+                let indent = &old[..old.len() - rest.len()];
+                let body = if rest.starts_with("- [") || rest.starts_with("* [") || rest.starts_with("+ [") {
+                    rest.to_owned()
+                } else if let Some(item) = rest.strip_prefix("- ").or_else(|| rest.strip_prefix("* ")) {
+                    format!("- [ ] {item}")
+                } else {
+                    format!("- [ ] {rest}")
+                };
+                let gap = if body.ends_with(' ') || body.ends_with("] ") { "" } else { " " };
+                let new = format!("{indent}{body}{gap}@");
+                tab.replace_line(line, &new);
+                tab.put_cursor(line, new.len());
+                self.refresh_completion();
+            }
             Command::NewTaskNote => return self.open_task_form(true),
             Command::ToggleTasks => {
                 if self.tasks.take().is_none() {
@@ -2487,7 +2799,7 @@ impl App {
                 self.notice(format!("{path} does not exist"));
                 Task::none()
             }
-            None => self.create(Some(&path)),
+            None => self.create(Some(&path), true),
         }
     }
 
@@ -2732,12 +3044,12 @@ impl App {
     }
 
     /// Creates a note in the vault root (or under the folders in `name`) and opens it.
-    fn create(&mut self, name: Option<&str>) -> Task<Message> {
+    fn create(&mut self, name: Option<&str>, default_template: bool) -> Task<Message> {
         self.palette = None;
         let vault = self.vault.clone();
         let name = name.map(sanitize_note_name);
-        // Only a note without a name starts from the default template.
-        let template = if name.as_deref().is_none_or(str::is_empty) { self.settings.new_note_template.clone() } else { None };
+        // Notes made from "New note" start from the default template; notes made by following a link stay empty.
+        let template = if default_template { self.settings.new_note_template.clone() } else { None };
         let (config, now) = (self.template_config(), sage_editor::now());
         Task::perform(
             async move {
@@ -2849,6 +3161,18 @@ impl App {
                 self.history_at = at as usize;
                 return self.open(path);
             }
+        }
+    }
+
+    /// Applies the "only marked checkboxes are tasks" setting: queries and the
+    /// task list run again, as after a change in the index.
+    fn apply_tracking(&mut self) {
+        sage_db::set_tracked_only(self.settings.tracked_tasks_only);
+        self.load_tasks();
+        for tab in &mut self.tabs {
+            tab.views.clear();
+            tab.task_lists.clear();
+            tab.stale = true;
         }
     }
 
@@ -3007,7 +3331,41 @@ impl App {
         Task::none()
     }
 
+    /// Closes every tab whose index `selected` picks, except the ones with
+    /// unsaved changes, which stay open and are named.
+    fn close_tabs(&mut self, selected: impl Fn(usize) -> bool) {
+        self.menu = None;
+        self.tab_menu = None;
+        let (gone, kept): (Vec<usize>, Vec<usize>) = (0..self.tabs.len())
+            .filter(|&i| selected(i) && !self.pinned.contains(&self.tabs[i].path))
+            .partition(|&i| !self.tabs[i].busy());
+        if !kept.is_empty() {
+            self.notice(format!("{} tab(s) with unsaved changes stay open", kept.len()));
+        }
+        let paths: Vec<String> = gone.iter().map(|&i| self.tabs[i].path.clone()).collect();
+        let current = self.tabs.get(self.active).map(|t| t.path.clone());
+        self.active = active_after(self.active, &self.tabs, |t| paths.contains(&t.path));
+        let mut closed = Vec::new();
+        self.tabs.retain(|t| {
+            let drop = paths.contains(&t.path);
+            if drop {
+                closed.push(t.path.clone());
+            }
+            !drop
+        });
+        self.closed.extend(closed);
+        // The current note stays current when it is not one that closed.
+        if let Some(i) = current.and_then(|c| self.tabs.iter().position(|t| t.path == c)) {
+            self.active = i;
+        }
+        self.completion = None;
+        self.find = None;
+        self.persist();
+    }
+
     fn close_tab(&mut self, i: usize) {
+        self.menu = None;
+        self.tab_menu = None;
         let Some(tab) = self.tabs.get(i) else { return };
         if tab.dirty {
             // Closing would drop unsaved text; autosave will finish shortly.
@@ -3110,6 +3468,7 @@ impl App {
             panes: Some(self.panes),
             tree_order: self.tree_order,
             recent: self.recent.clone(),
+            pinned: self.pinned.clone(),
             outline: self.outline_open,
             zoom: Some(self.zoom),
         };
@@ -3140,6 +3499,11 @@ impl App {
                     .collect::<Result<Vec<_>, _>>()
             });
         if let Ok(rows) = rows {
+            let aliases: Vec<String> = reader
+                .prepare_cached("SELECT alias_lc FROM aliases")
+                .and_then(|mut stmt| stmt.query_map([], |r| r.get(0))?.collect())
+                .unwrap_or_default();
+            live::set_known(rows.iter().map(|f| f.path.clone()), aliases);
             self.files = rows;
         }
     }
@@ -3312,6 +3676,9 @@ impl App {
             });
         if let Ok(rows) = rows {
             tab.backlinks = rows;
+        }
+        if let Ok(rows) = tasks::followups(reader, &tab.path) {
+            tab.followups = rows;
         }
 
         let rows = reader
@@ -3521,8 +3888,9 @@ impl App {
     /// A status message the user needs to read, kept up for `NOTICE_FOR`
     /// instead of giving way to the next index pass.
     fn notice(&mut self, message: String) {
-        self.status = message;
+        self.status = message.clone();
         self.status_until = Instant::now() + NOTICE_FOR;
+        self.toast = Some(Toast { text: message, undo: None, until: Instant::now() + TOAST_FOR });
     }
 
     // ---- tasks --------------------------------------------------------------
@@ -3899,7 +4267,7 @@ impl App {
     fn quick_entries(&self) -> Vec<QuickAdd> {
         let prefix = format!("{}/", self.template_config().folder);
         let own = self.settings.quick_add.iter().cloned();
-        let templates = self.files.iter().filter(|f| f.path.starts_with(&prefix) && f.path.ends_with(".md")).map(|f| QuickAdd::Template {
+        let templates = self.files.iter().filter(|f| self.settings.quick_add_templates.unwrap_or(true) && f.path.starts_with(&prefix) && f.path.ends_with(".md")).map(|f| QuickAdd::Template {
             name: f.title.clone(),
             template: f.path.clone(),
             folder: String::new(),
@@ -4187,6 +4555,7 @@ impl App {
                 query: text.trim_start_matches('[').trim_end_matches(']').to_owned(),
                 start: 0,
                 closed: false,
+                tagged: false,
             })
         } else {
             complete::context(&text, text.len()).filter(|c| c.kind == complete::Kind::Link)
@@ -4196,7 +4565,7 @@ impl App {
         // A name that matches no note links to one that following the link creates.
         let query = ctx.query.trim();
         if link_property && !query.is_empty() && !items.iter().any(|i| i.value.eq_ignore_ascii_case(query)) {
-            items.push(Suggestion { label: format!("Create “{query}”"), detail: "new note".into(), value: query.to_owned() });
+            items.push(Suggestion { label: format!("Create “{query}”"), detail: "new note".into(), value: query.to_owned(), date: false });
         }
         if items.is_empty() {
             return;
@@ -4246,6 +4615,15 @@ impl App {
     /// Asks whether the first empty list item of the properties still has the
     /// focus, so that one left empty is removed, as in Obsidian.
     fn prune_check(&self) -> Task<Message> {
+        let new = if self.new_property.as_ref().is_some_and(|(_, s)| s.trim().is_empty()) {
+            iced::widget::operation::is_focused(iced::widget::Id::from(preview::NEW_PROPERTY)).map(Message::NewPropertyBlur)
+        } else {
+            Task::none()
+        };
+        Task::batch([new, self.prune_items()])
+    }
+
+    fn prune_items(&self) -> Task<Message> {
         use sage_editor::properties::Value;
         let Some(tab) = self.tabs.get(self.active).filter(|t| t.loaded) else { return Task::none() };
         let Some(lines) = tab.frontmatter_lines() else { return Task::none() };
@@ -4307,7 +4685,11 @@ impl App {
             position: cursor.position,
             selection: Some(Position { line: c.line, column: c.ctx.start }),
         });
-        let insert = complete::insertion(&c.ctx, &item.value);
+        let mut ctx = c.ctx.clone();
+        if item.date {
+            ctx.kind = complete::Kind::Date;
+        }
+        let insert = complete::insertion(&ctx, &item.value);
         tab.content.perform(text_editor::Action::Edit(Edit::Paste(Arc::new(insert))));
         // Step past a closing bracket that was already there.
         if c.ctx.closed {
@@ -4367,6 +4749,13 @@ impl App {
                 return;
             }
             PaletteMode::NewFolder => return,
+            PaletteMode::NewNote => {
+                let name = sanitize_note_name(palette.query.trim());
+                if !name.is_empty() {
+                    palette.hits = vec![Hit { label: format!("Create {name}"), detail: String::new(), action: HitAction::Create(name) }];
+                }
+                return;
+            }
             PaletteMode::Everywhere(None) => {
                 palette.hits = vec![Hit { label: "Reading the vault…".into(), detail: String::new(), action: HitAction::Nothing }];
                 return;
@@ -4488,7 +4877,18 @@ impl App {
             ]
         };
         let base = container(workspace).width(Fill).height(Fill).style(move |_| theme::page(t));
+        let base: Element<'_, Message> = match self.context_menu(t) {
+            Some(menu) => stack![base, menu].into(),
+            None => base.into(),
+        };
+        let base: Element<'_, Message> = match self.toast_overlay(t) {
+            Some(toast) => stack![base, toast].into(),
+            None => base,
+        };
 
+        if self.help {
+            return stack![base, self.help_overlay(t)].into();
+        }
         if let Some(doomed) = &self.doomed {
             return stack![base, self.confirm_overlay(t, doomed)].into();
         }
@@ -4499,6 +4899,70 @@ impl App {
             Some(palette) => stack![base, self.palette_overlay(t, palette)].into(),
             None => base.into(),
         }
+    }
+
+    /// The menu a right click on a note, a folder or a tab opens, floating at
+    /// the pointer. Any click outside it closes it.
+    fn context_menu(&self, t: Tokens) -> Option<Element<'_, Message>> {
+        let (_, folder) = self.menu.as_ref()?;
+        let choice = |label: &str, message: Message| -> Element<'_, Message> {
+            button(text(label.to_owned()).size(13))
+                .width(Fill)
+                .padding([4, 10])
+                .style(move |_, status| theme::nav_button(t, false, status))
+                .on_press(message)
+                .into()
+        };
+        let reveal = if cfg!(windows) { "Show in Explorer" } else { "Show in file manager" };
+        let mut items = Column::new().spacing(1);
+        let mut count = 0;
+        if let Some(i) = self.tab_menu {
+            items = items
+                .push(choice("Close", Message::CloseTab(i)))
+                .push(choice("Close others", Message::CloseOtherTabs(i)))
+                .push(choice("Close tabs to the right", Message::CloseTabsRight(i)))
+                .push(choice("Close all", Message::CloseAllTabs))
+                .push(container(hline(t)).padding([3, 0]));
+            count += 5;
+        }
+        items = items.push(choice("Rename or move", Message::MenuRename));
+        if let Some(i) = self.tab_menu {
+            let pinned = self.tabs.get(i).is_some_and(|t| self.pinned.contains(&t.path));
+            items = items
+                .push(choice(if pinned { "Unpin" } else { "Pin" }, Message::PinTab(i)))
+                .push(choice("Move left", Message::MoveTab(i, -1)))
+                .push(choice("Move right", Message::MoveTab(i, 1)));
+            count += 3;
+        }
+        if self.tab_menu.is_none() {
+            items = items.push(choice("Delete", Message::MenuDelete));
+            count += 1;
+        }
+        items = items
+            .push(choice(reveal, Message::MenuReveal))
+            .push(choice(if *folder { "Copy path" } else { "Copy link" }, Message::MenuCopyLink));
+        count += 3;
+
+        // Kept inside the window: the menu opens up or to the left where it
+        // would run off the bottom or the right edge.
+        let (width, height) = (200.0, count as f32 * 27.0 + 12.0);
+        let window_height = f32::from_bits(WINDOW_HEIGHT.load(std::sync::atomic::Ordering::Relaxed));
+        let window_height = if window_height > 0.0 { window_height } else { 4000.0 };
+        let x = self.menu_at.x.min(self.window_width - width - 4.0).max(0.0);
+        let y = self.menu_at.y.min(window_height - height - 4.0).max(0.0);
+        let menu = container(items.width(width))
+            .padding(4)
+            .style(move |_| theme::panel(t));
+        let outside = iced::widget::mouse_area(container(space()).width(Fill).height(Fill))
+            .on_press(Message::CloseMenu)
+            .on_right_press(Message::CloseMenu);
+        Some(
+            stack![
+                outside,
+                container(menu).width(Fill).height(Fill).padding(iced::Padding { top: y, left: x, right: 0.0, bottom: 0.0 }),
+            ]
+            .into(),
+        )
     }
 
     fn sidebar(&self, t: Tokens) -> Element<'_, Message> {
@@ -4516,6 +4980,7 @@ impl App {
                         Message::Key(Shortcut::Command(Command::ToggleOutline)),
                         t
                     ),
+                    header_button("✓", "Tasks", Message::Key(Shortcut::Command(Command::ToggleTasks)), t),
                     header_button("⚙", "Settings", Message::ToggleSettings, t),
                 ]
                 .spacing(2)
@@ -4549,7 +5014,6 @@ impl App {
                     &self.expanded,
                     self.tree_order,
                     current,
-                    self.menu.as_ref().map(|(path, _)| path.as_str()),
                     t
                 ))
                 .padding([8, 8])
@@ -4591,6 +5055,7 @@ impl App {
         if self.settings_open {
             let ctx = settings::Ctx {
                 settings: &self.settings,
+                current_note: self.tabs.get(self.active).map(|t| t.path.as_str()),
                 obsidian_folder: &self.obsidian_templates.folder,
                 folders: self.folders(),
                 templates: template_hits(&self.template_config(), "", &self.files)
@@ -4613,6 +5078,7 @@ impl App {
                 recording_built_in: self.recording_built_in,
                 fixed: &FIXED,
                 vault: &self.vault,
+                filter: &self.shortcut_filter,
                 t,
             };
             return column![self.tab_bar(t), hline(t), settings::view(ctx)].width(Fill).into();
@@ -4621,14 +5087,37 @@ impl App {
             return column![self.tab_bar(t), hline(t), tasks::view(list, t)].width(Fill).into();
         }
         let Some(tab) = self.tabs.get(self.active) else {
+            let action = |label: &'static str, message: Message| {
+                button(text(label).size(14))
+                    .padding([6, 14])
+                    .style(move |_, status| theme::nav_button(t, false, status))
+                    .on_press(message)
+            };
+            let mut recent = Column::new().spacing(2);
+            for path in self.recent.iter().filter(|p| self.files.iter().any(|f| &f.path == *p)).take(6) {
+                recent = recent.push(
+                    button(text(file_stem(path).to_owned()).size(15))
+                        .padding([2, 0])
+                        .style(move |_, status| theme::link_button(t, status))
+                        .on_press(Message::Open(path.clone())),
+                );
+            }
             return container(
                 column![
                     text("No note open").size(26).font(theme::SERIF).color(t.text),
-                    text("Ctrl+P to find or create a note, Ctrl+N for a new one, > for commands")
-                        .size(15)
-                        .color(t.text_2),
+                    row![
+                        action("New note", Message::Run(Command::NewNote)),
+                        action("Quick add", Message::Run(Command::QuickAdd)),
+                        action("Today's note", Message::Run(Command::DailyNote)),
+                        action("Search", Message::Run(Command::SearchEverywhere)),
+                    ]
+                    .spacing(8),
+                    text("Recent").size(12).font(theme::SANS_BOLD).color(t.text_2),
+                    recent,
+                    text("Ctrl+P finds or creates a note · F1 lists every shortcut").size(13).color(t.text_2),
                 ]
-                .spacing(8),
+                .spacing(12)
+                .align_x(iced::Center),
             )
             .center(Fill)
             .into();
@@ -4716,7 +5205,8 @@ impl App {
                             })
                             .collect();
                         let editing = self.editing_prop.as_ref().filter(|(p, _)| *p == tab.path).map(|(_, e)| *e);
-                        preview::property_editor(types, popup, self.type_menu, self.chip_hover, editing, &self.new_property, t)
+                        let template = tab.path.starts_with(&format!("{}/", self.template_config().folder));
+                        preview::property_editor(types, popup, self.type_menu, self.chip_hover, editing, template, self.new_property.as_ref().map(|(ty, s)| (*ty, s.as_str())), t)
                     } else {
                         preview::blocks(&i.blocks, ctx)
                     };
@@ -4751,6 +5241,12 @@ impl App {
             }
         };
 
+        let panes: Element<'_, Message> = if tab.followups.is_empty() {
+            panes
+        } else {
+            column![container(panes).height(Fill), hline(t), tasks::followup_panel(&tab.followups, t)].into()
+        };
+
         // A OneDrive conflict copy waits above the note until it is merged.
         let banner: Element<'_, Message> = match tab.copies.first() {
             Some(copy) => column![
@@ -4777,6 +5273,43 @@ impl App {
             .into(),
             None => space().into(),
         };
+        // The note's name above the page, in every view mode, with where it
+        // lives and the way to switch how it is shown.
+        let folder = tab.path.rsplit_once('/').map(|(f, _)| f.replace('/', "  ›  ")).unwrap_or_default();
+        let mode_button = |label: &'static str, hint: &'static str, mode: ViewMode| -> Element<'_, Message> {
+            let on = self.view_mode == mode;
+            iced::widget::tooltip(
+                button(text(label).size(12))
+                    .padding([2, 8])
+                    .style(move |_, status| theme::nav_button(t, on, status))
+                    .on_press(Message::Run(Command::View(mode))),
+                container(text(hint).size(12)).padding([3, 8]).style(move |_| theme::panel(t)),
+                iced::widget::tooltip::Position::Bottom,
+            )
+            .into()
+        };
+        let modes = row![
+            mode_button("Source", "Markdown source", ViewMode::Source),
+            mode_button("Split", "Source and preview side by side", ViewMode::Split),
+            mode_button("Preview", "Rendered note", ViewMode::Preview),
+            mode_button("Live", "Formatted as you type", ViewMode::Live),
+        ]
+        .spacing(2);
+        let heading: Element<'_, Message> = container(
+            column![
+                row![
+                    text(folder).size(12).color(t.text_2).wrapping(text::Wrapping::None),
+                    space().width(Fill),
+                    modes,
+                ]
+                .align_y(iced::Center),
+                text(&tab.title).size(22).font(theme::SERIF).color(t.text).wrapping(text::Wrapping::None),
+            ]
+            .spacing(2),
+        )
+        .padding([8, 16])
+        .width(Fill)
+        .into();
         if self.focus {
             // A comfortable reading width; side by side keeps the whole window.
             let panes = if self.view_mode == ViewMode::Split {
@@ -4784,9 +5317,9 @@ impl App {
             } else {
                 container(container(panes).max_width(FOCUS_WIDTH)).center_x(Fill).into()
             };
-            return column![banner, panes].width(Fill).into();
+            return column![banner, heading, panes].width(Fill).into();
         }
-        column![self.tab_bar(t), hline(t), banner, panes].width(Fill).into()
+        column![self.tab_bar(t), hline(t), banner, heading, hline(t), panes].width(Fill).into()
     }
 
     /// The editor always sits in the same two-layer stack. Swapping it
@@ -4971,17 +5504,16 @@ impl App {
             let active = i == self.active && self.tasks.is_none();
             let (label, color) = if tab.conflict {
                 (format!("{} !", tab.title), t.error)
-            } else if tab.dirty {
-                (format!("{} •", tab.title), if active { t.text } else { t.text_2 })
             } else {
                 (tab.title.clone(), if active { t.text } else { t.text_2 })
             };
+            let pinned = self.pinned.contains(&tab.path);
             let tab_button = row![
-                button(text(label).size(14).color(color))
+                button(text(if pinned { format!("▪ {label}") } else { label }).size(14).color(color))
                     .padding([8, 12])
                     .style(move |_, status| theme::nav_button(t, false, status))
                     .on_press(Message::SelectTab(i)),
-                button(text("×").size(14))
+                button(text(if tab.dirty { "•" } else { "×" }).size(14))
                     .padding([8, 8])
                     .style(move |_, status| theme::nav_button(t, false, status))
                     .on_press(Message::CloseTab(i)),
@@ -4989,7 +5521,9 @@ impl App {
             bar = bar.push(
                 column![
                     // A middle click closes the tab, as in a browser.
-                    iced::widget::mouse_area(container(tab_button).height(Fill)).on_middle_press(Message::CloseTab(i)),
+                    iced::widget::mouse_area(container(tab_button).height(Fill))
+                        .on_middle_press(Message::CloseTab(i))
+                        .on_right_press(Message::TabMenu(i)),
                     // The highlight rule under the current tab.
                     container(space()).height(2).width(Fill).style(move |_| theme::accent_rule(t, active)),
                 ]
@@ -4997,7 +5531,10 @@ impl App {
             );
             bar = bar.push(vline(t));
         }
-        scrollable(bar).direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::new().width(0).scroller_width(0))).into()
+        scrollable(bar)
+            .id(TABS)
+            .direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::new().width(0).scroller_width(0)))
+            .into()
     }
 
     fn preview<'a>(&'a self, t: Tokens, tab: &'a Tab) -> Element<'a, Message> {
@@ -5090,6 +5627,84 @@ impl App {
         .into()
     }
 
+    /// The newest notice floating at the bottom right, with Undo when a note
+    /// was just moved to `.trash`.
+    fn toast_overlay(&self, t: Tokens) -> Option<Element<'_, Message>> {
+        let toast = self.toast.as_ref()?;
+        let small = |label: &'static str, message: Message| {
+            button(text(label).size(13))
+                .padding([3, 10])
+                .style(move |_, status| theme::nav_button(t, false, status))
+                .on_press(message)
+        };
+        let mut line = Row::new().spacing(10).align_y(iced::Center).push(text(&toast.text).size(13).color(t.text));
+        if toast.undo.is_some() {
+            line = line.push(small("Undo", Message::UndoTrash));
+        }
+        line = line.push(small("×", Message::DismissToast));
+        let card = container(line).padding([8, 12]).max_width(560).style(move |_| theme::panel(t));
+        Some(container(card).width(Fill).height(Fill).align_right(Fill).align_bottom(Fill).padding([40, 16]).into())
+    }
+
+    /// Every shortcut in one place: Sage's own as the vault has them set, then
+    /// what the editor does, then the mouse and the `@` and `[[` popups.
+    fn help_overlay(&self, t: Tokens) -> Element<'_, Message> {
+        let line = |keys: String, what: String| -> Element<'_, Message> {
+            row![text(keys).size(13).font(theme::MONO).color(t.text).width(150), text(what).size(13).color(t.text_2)]
+                .spacing(10)
+                .into()
+        };
+        let heading = |title: &'static str| text(title).size(12).font(theme::SANS_BOLD).color(t.text_2);
+        let mut own = Column::new().spacing(3);
+        for i in 0..BUILT_IN.len() {
+            if let Some(keys) = built_in_chord(i, &self.settings) {
+                own = own.push(line(keys.to_string(), command_name(BUILT_IN[i].1).to_owned()));
+            }
+        }
+        let mut editing = Column::new().spacing(3);
+        for (keys, what) in EDITING {
+            editing = editing.push(line(keys.to_owned(), what.to_owned()));
+        }
+        let tricks = column![
+            line("[[".into(), "links to a note; Ctrl+click follows one, creating it if missing".into()),
+            line("@".into(), "dates such as tomorrow or next friday; people in a task".into()),
+            line("#".into(), "tags".into()),
+            line("Right click".into(), "menu on a note, folder or tab".into()),
+            line("Middle click".into(), "closes a tab".into()),
+        ]
+        .spacing(3);
+        let panel = container(
+            column![
+                row![
+                    text("Keyboard shortcuts").size(20).font(theme::SERIF).color(t.text),
+                    space().width(Fill),
+                    button(text("Close").size(13))
+                        .padding([3, 10])
+                        .style(move |_, status| theme::nav_button(t, false, status))
+                        .on_press(Message::Run(Command::Shortcuts)),
+                ]
+                .align_y(iced::Center),
+                scrollable(
+                    column![heading("SAGE"), own, heading("EDITING"), editing, heading("TIPS"), tricks].spacing(8).padding([0, 12])
+                )
+                .height(Fill),
+            ]
+            .spacing(12),
+        )
+        .padding(18)
+        .width(560)
+        .max_height(520)
+        .style(move |_| theme::panel(t));
+        iced::widget::opaque(
+            container(panel)
+                .width(Fill)
+                .height(Fill)
+                .align_x(iced::Center)
+                .padding(iced::Padding { top: 60.0, ..iced::Padding::ZERO })
+                .style(move |_| theme::scrim(t)),
+        )
+    }
+
     /// Asks before a note or folder goes to `.trash`. Esc cancels.
     fn confirm_overlay<'a>(&'a self, t: Tokens, doomed: &'a Doomed) -> Element<'a, Message> {
         let (title, detail) = if doomed.folder {
@@ -5171,6 +5786,7 @@ impl App {
             PaletteMode::QuickAdd => "Quick add".to_owned(),
             PaletteMode::Everywhere(_) => "Search everywhere".to_owned(),
             PaletteMode::NewFolder => "Name of the new folder, with / for folders in folders".to_owned(),
+            PaletteMode::NewNote => "Name of the new note, with / for folders".to_owned(),
             PaletteMode::QuickAddValue(i) => match self.quick_entries().get(i) {
                 Some(QuickAdd::Capture { name, .. }) => format!("{name}: what to add"),
                 Some(entry) => format!("{}: name of the new note", entry.name()),
@@ -5346,6 +5962,19 @@ fn is_picture(path: &str) -> bool {
 /// extension with a letter in it, other than `.md`. `[[v1.2 plan]]` is a note.
 /// What a link written in the note, such as `[[Note#Heading|alias]]`, leads
 /// to, read as the preview reads it. Attachments lead nowhere yet.
+/// The `[[link]]` as written whose brackets or text hold byte column `col`.
+fn wikilink_at(line: &str, col: usize) -> Option<&str> {
+    let mut from = 0;
+    while let Some(open) = line[from..].find("[[").map(|i| i + from) {
+        let close = open + line[open..].find("]]")? + 2;
+        if (open..=close).contains(&col) {
+            return Some(&line[open..close]);
+        }
+        from = close;
+    }
+    None
+}
+
 fn link_target(source: &str) -> Option<LinkTarget> {
     let blocks = sage_markdown::parse(source);
     let Some(sage_markdown::Block::Paragraph(inline)) = blocks.first() else { return None };
@@ -5575,6 +6204,8 @@ fn suggestion_list<'a>(
         complete::Kind::Embed => "Embed",
         complete::Kind::Tag => "Tag",
         complete::Kind::Path => "Path",
+        complete::Kind::Person => "Person",
+        complete::Kind::Date => "Date",
     };
     let mut list = Column::new().spacing(1);
     for (i, item) in items.iter().enumerate() {
@@ -5792,10 +6423,25 @@ fn load_settings(vault: PathBuf) -> Task<Message> {
 fn window_width(event: iced::Event, _status: iced::event::Status, _window: iced::window::Id) -> Option<Message> {
     match event {
         iced::Event::Window(iced::window::Event::Opened { size, .. } | iced::window::Event::Resized(size)) => {
+            WINDOW_HEIGHT.store(size.height.to_bits(), std::sync::atomic::Ordering::Relaxed);
             Some(Message::WindowWidth(size.width))
         }
         _ => None,
     }
+}
+
+/// Remembers where the pointer is, for the menu a right click opens.
+fn track_pointer(event: iced::Event, _status: iced::event::Status, _window: iced::window::Id) -> Option<Message> {
+    if let iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) = event {
+        let bits = (u64::from(position.x.to_bits()) << 32) | u64::from(position.y.to_bits());
+        POINTER.store(bits, std::sync::atomic::Ordering::Relaxed);
+    }
+    None
+}
+
+fn pointer() -> iced::Point {
+    let bits = POINTER.load(std::sync::atomic::Ordering::Relaxed);
+    iced::Point::new(f32::from_bits((bits >> 32) as u32), f32::from_bits(bits as u32))
 }
 
 /// Where the pointer is across the window, while a divider is dragged.

@@ -183,7 +183,12 @@ SELECT t.id,
        t.scheduled,
        t.start,
        t.done_on,
-       t.priority
+       t.priority,
+       -- Whether the line is a task to follow globally: tagged #task or
+       -- #followup, or given a due date. Plain checkboxes are checklists.
+       (t.due IS NOT NULL
+        OR EXISTS (SELECT 1 FROM tags g WHERE g.file_id = t.file_id AND g.line = t.line
+                   AND lower(g.tag) IN ('task', 'followup'))) AS tracked
 FROM tasks t
 JOIN files f ON f.id = t.file_id;
 

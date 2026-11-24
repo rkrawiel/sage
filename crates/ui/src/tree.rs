@@ -48,13 +48,11 @@ struct Node<'a> {
 
 const INDENT: f32 = 14.0;
 
-/// What the tree shows besides the files: open folders, the current note,
-/// and the item whose menu is open.
+/// What the tree shows besides the files: open folders and the current note.
 struct Show<'s> {
     expanded: &'s HashSet<String>,
     order: Order,
     current: Option<&'s str>,
-    menu: Option<&'s str>,
     t: Tokens,
 }
 
@@ -65,7 +63,6 @@ pub fn view<'a>(
     expanded: &HashSet<String>,
     order: Order,
     current: Option<&str>,
-    menu: Option<&str>,
     t: Tokens,
 ) -> Element<'a, Message> {
     let mut root = Node::default();
@@ -80,7 +77,7 @@ pub fn view<'a>(
     sort_files(&mut root, order);
 
     let mut rows = Vec::new();
-    push_node(&mut rows, &root, "", 0, &Show { expanded, order, current, menu, t });
+    push_node(&mut rows, &root, "", 0, &Show { expanded, order, current, t });
     Column::with_children(rows).spacing(1).into()
 }
 
@@ -180,9 +177,6 @@ fn push_node<'a>(rows: &mut Vec<Element<'a, Message>>, node: &Node<'a>, prefix: 
         .style(move |_, status| theme::nav_button(t, false, status))
         .on_press(Message::ToggleFolder(path.clone()));
         rows.push(mouse_area(entry).on_right_press(Message::TreeMenu(path.clone(), true)).into());
-        if show.menu == Some(path.as_str()) {
-            rows.push(menu(indent + 18.0, t));
-        }
 
         if open {
             push_node(rows, child, &path, depth + 1, show);
@@ -204,27 +198,7 @@ fn push_node<'a>(rows: &mut Vec<Element<'a, Message>>, node: &Node<'a>, prefix: 
             .style(move |_, status| theme::nav_button(t, is_current, status))
             .on_press(Message::Open(file.path.clone()));
         rows.push(mouse_area(entry).on_right_press(Message::TreeMenu(file.path.clone(), false)).into());
-        if show.menu == Some(file.path.as_str()) {
-            rows.push(menu(indent + 18.0, t));
-        }
     }
-}
-
-/// The menu a right click opens, under the item it was opened on.
-fn menu<'a>(indent: f32, t: Tokens) -> Element<'a, Message> {
-    let choice = |label: &'a str, message: Message| {
-        button(text(label).size(13)).padding([3, 8]).style(move |_, status| theme::nav_button(t, false, status)).on_press(message)
-    };
-    let reveal = if cfg!(windows) { "Show in Explorer" } else { "Show in file manager" };
-    container(
-        column![
-            row![choice("Rename or move", Message::MenuRename), choice("Delete", Message::MenuDelete)].spacing(4),
-            row![choice(reveal, Message::MenuReveal), choice("Copy link", Message::MenuCopyLink)].spacing(4),
-        ]
-        .spacing(2),
-    )
-        .padding(iced::Padding { top: 2.0, bottom: 4.0, left: indent, right: 8.0 })
-        .into()
 }
 
 fn sort_files(node: &mut Node<'_>, order: Order) {

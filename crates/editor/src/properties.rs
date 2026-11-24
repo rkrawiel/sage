@@ -221,7 +221,7 @@ fn value_of(rest: &str, body: &[String]) -> Value {
         "false" => return Value::Bool(false),
         _ => {}
     }
-    if v.starts_with(['|', '>', '{', '&', '*', '!', '%', '@', '`']) || (!v.starts_with(['"', '\'']) && v.contains(" #")) {
+    if (v.starts_with(['|', '>', '{', '&', '*', '!', '%', '@', '`']) && !is_placeholder(v)) || (!v.starts_with(['"', '\'']) && v.contains(" #")) {
         return raw(rest);
     }
     match scalar(value) {
@@ -309,8 +309,15 @@ fn split_flow(inner: &str) -> Option<Vec<String>> {
     Some(items)
 }
 
+/// Whether `text` is a template placeholder such as `{{date}}`, which a note
+/// made from the template replaces, so it is kept unquoted.
+pub fn is_placeholder(text: &str) -> bool {
+    text.len() > 4 && text.starts_with("{{") && text.ends_with("}}") && !text.contains(": ") && !text.contains(" #")
+}
+
 /// Whether `text` must be quoted to read back as the same text.
 fn needs_quote(text: &str) -> bool {
+    !is_placeholder(text) && (
     text.is_empty()
         || text != text.trim_matches(' ')
         || text.starts_with(['[', ']', '{', '}', ',', '&', '*', '!', '|', '>', '\'', '"', '%', '@', '`', '#', '?', ':'])
@@ -319,7 +326,7 @@ fn needs_quote(text: &str) -> bool {
         || text.contains(": ")
         || text.contains(" #")
         || text.ends_with(':')
-        || matches!(text, "true" | "false" | "null" | "~" | "True" | "False" | "Null" | "yes" | "no")
+        || matches!(text, "true" | "false" | "null" | "~" | "True" | "False" | "Null" | "yes" | "no"))
 }
 
 fn write_scalar(text: &str, quote: Option<char>, empty_ok: bool) -> String {
@@ -387,6 +394,14 @@ mod tests {
 
     fn text(t: &str) -> Value {
         Value::Text { text: t.into(), quote: None }
+    }
+
+    #[test]
+    fn a_template_placeholder_is_a_plain_unquoted_value() {
+        let entries = parse(&fm("due: {{date}}\n"));
+        assert_eq!(entries[0].value, text("{{date}}"));
+        assert_eq!(write("due", &text("{{date}}")), vec!["due: {{date}}".to_owned()]);
+        assert!(!is_placeholder("{a: b}"));
     }
 
     #[test]

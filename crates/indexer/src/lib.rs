@@ -811,6 +811,19 @@ mod tests {
     }
 
     #[test]
+    fn only_marked_checkboxes_are_tracked_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).unwrap();
+        fs::write(vault.join("A.md"), "- [ ] plain\n- [ ] tagged #task\n- [ ] follow #FollowUp\n- [ ] dated 📅 2026-12-01\n- [ ] other #idea\n").unwrap();
+        age(&vault.join("A.md"));
+        let mut ix = Indexer::open(vault.canonicalize().unwrap(), &dir.path().join("index.db")).unwrap();
+        ix.reconcile(&mut |_| {}).unwrap();
+        assert_eq!(count(&ix, "SELECT count(*) FROM v_tasks"), 5);
+        assert_eq!(count(&ix, "SELECT count(*) FROM v_tasks WHERE tracked"), 3);
+    }
+
+    #[test]
     fn reconcile_is_incremental_and_tracks_renames() {
         let dir = tempfile::tempdir().unwrap();
         let vault = dir.path().join("vault");

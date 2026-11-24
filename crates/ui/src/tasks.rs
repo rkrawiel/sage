@@ -7,7 +7,7 @@
 
 use crate::theme::{self, Tokens};
 use crate::{file_stem, plain_links, Message, TaskRef};
-use iced::widget::{button, column, container, row, scrollable, space, text, Column};
+use iced::widget::{button, column, container, row, scrollable, space, text, Column, Row};
 use iced::{Element, Fill};
 use rusqlite::Connection;
 use sage_core::TaskStatus;
@@ -21,6 +21,33 @@ pub struct TaskList {
     pub rows: Vec<TaskRow>,
     /// `YYYY-MM-DD`, compared with due dates as text.
     pub today: String,
+    pub filter: Filter,
+}
+
+/// Which of the open tasks the list shows.
+#[derive(Default, Clone, Copy, PartialEq, Debug)]
+pub enum Filter {
+    #[default]
+    All,
+    /// Due today or before.
+    Due,
+    Followups,
+    /// Without the ones completed today.
+    Open,
+}
+
+impl Filter {
+    const ALL: [(Filter, &'static str); 4] =
+        [(Filter::All, "All"), (Filter::Due, "Due or overdue"), (Filter::Followups, "Follow-ups"), (Filter::Open, "Open only")];
+
+    fn keeps(self, row: &TaskRow, today: &str) -> bool {
+        match self {
+            Filter::All => true,
+            Filter::Due => !row.done && row.due.as_deref().is_some_and(|d| d <= today),
+            Filter::Followups => row.text.to_lowercase().contains("#followup"),
+            Filter::Open => !row.done,
+        }
+    }
 }
 
 pub struct TaskRow {
@@ -46,12 +73,14 @@ pub struct TaskRow {
 /// today when it is `done` and the note changed today, as documents have no
 /// completion date. Cancelled tasks (`[-]`, `status: cancelled`) are neither.
 pub fn load(db: &Connection, today: &str) -> rusqlite::Result<Vec<TaskRow>> {
-    let mut stmt = db.prepare_cached(
-        "SELECT path, line, raw, text, due, done, document, status, tags FROM (
+    let sql = "SELECT path, line, raw, text, due, done, document, status, tags FROM (
              SELECT path, line, raw, text, due, state IN ('x', 'X') AS done, priority,
                     0 AS document, NULL AS status, NULL AS tags
              FROM v_tasks
-             WHERE state NOT IN ('x', 'X', '-') OR done_on = ?1
+             WHERE (state NOT IN ('x', 'X', '-') OR done_on = ?1)@TRACKED@"
+        .replace("@TRACKED@", sage_db::tracked_clause());
+    let mut stmt = db.prepare_cached(&format!(
+        "{sql}
              UNION ALL
              SELECT d.path, 0, '', d.title, d.due, d.status IS 'done', NULL, 1, d.status, d.tags
              FROM v_documents d JOIN v_notes n ON n.id = d.id
@@ -59,8 +88,8 @@ pub fn load(db: &Connection, today: &str) -> rusqlite::Result<Vec<TaskRow>> {
                AND (d.status IS NULL OR d.status NOT IN ('done', 'cancelled')
                     OR (d.status = 'done' AND date(n.modified, 'unixepoch', 'localtime') = ?1)))
          ORDER BY due IS NULL, due, priority DESC, path COLLATE NOCASE, line
-         LIMIT ?2",
-    )?;
+         LIMIT ?2"
+    ))?;
     let rows = stmt.query_map((today, LIMIT as i64), |r| {
         let text: String = r.get(3)?;
         let document: bool = r.get(6)?;
@@ -83,6 +112,70 @@ pub fn load(db: &Connection, today: &str) -> rusqlite::Result<Vec<TaskRow>> {
         })
     })?;
     rows.collect()
+}
+
+/// Open tasks tagged `#followup` that link to the note at `path`, oldest
+/// note first. Done tasks drop out because only the open state matches.
+pub fn followups(db: &Connection, path: &str) -> rusqlite::Result<Vec<TaskRow>> {
+    let mut stmt = db.prepare_cached(
+        "SELECT DISTINCT t.path, t.line, t.raw, t.text FROM v_tasks t
+         JOIN links l ON l.src_file_id = t.file_id AND l.line = t.line
+         JOIN files d ON d.id = l.dst_file_id
+         JOIN tags g ON g.file_id = t.file_id AND g.line = t.line
+         WHERE d.path = ?1 AND t.state = ' ' AND g.tag = 'followup' AND t.file_id <> d.id
+         ORDER BY t.path COLLATE NOCASE, t.line
+         LIMIT 200",
+    )?;
+    let rows = stmt.query_map([path], |r| {
+        let text: String = r.get(3)?;
+        Ok(TaskRow {
+            path: r.get(0)?,
+            line: r.get(1)?,
+            raw: r.get(2)?,
+            text: plain_links(&sage_core::task_display(&text)),
+            due: None,
+            done: false,
+            document: false,
+            status: None,
+        })
+    })?;
+    rows.collect()
+}
+
+/// The Follow-ups panel under a note: each open task with its source note.
+pub fn followup_panel(rows: &[TaskRow], t: Tokens) -> Element<'_, Message> {
+    let mut list = Column::new().spacing(2);
+    for task in rows {
+        let tref = task_ref(task);
+        list = list.push(
+            row![
+                button(container(space()).width(13).height(13).style(move |_| theme::checkbox(t, false)))
+                    .padding([6, 6])
+                    .style(move |_, status| theme::nav_button(t, false, status))
+                    .on_press(Message::ViewTask(tref)),
+                button(text(&task.text).size(14).color(t.text))
+                    .width(Fill)
+                    .padding([4, 6])
+                    .style(move |_, status| theme::nav_button(t, false, status))
+                    .on_press(Message::OpenAt(task.path.clone(), task.line as usize)),
+                text(file_stem(&task.path)).size(12).color(t.text_2).wrapping(text::Wrapping::None),
+            ]
+            .spacing(8)
+            .align_y(iced::Center),
+        );
+    }
+    container(
+        column![
+            text("Follow-ups").size(13).color(t.text_2),
+            scrollable(list).height(iced::Length::Shrink),
+        ]
+        .spacing(4),
+    )
+    .padding([8, 16])
+    .max_height(180)
+    .width(Fill)
+    .style(move |_| theme::surface(t))
+    .into()
 }
 
 /// What a row's checkbox writes to.
@@ -154,12 +247,30 @@ pub fn view(list: &TaskList, t: Tokens) -> Element<'_, Message> {
         ]
         .spacing(4),
     );
+    let mut filters = Row::new().spacing(6);
+    for (filter, label) in Filter::ALL {
+        let on = list.filter == filter;
+        filters = filters.push(
+            button(text(label).size(13))
+                .padding([3, 10])
+                .style(move |_, status| theme::nav_button(t, on, status))
+                .on_press(Message::TaskFilter(filter)),
+        );
+    }
+    page = page.push(container(filters).padding([10, 0]));
     if list.rows.is_empty() {
         page = page.push(container(text("No open tasks").size(15).color(t.text_2)).padding([16, 0]));
+    } else if !list.rows.iter().any(|r| list.filter.keeps(r, &list.today)) {
+        page = page.push(container(text("No task matches this filter").size(15).color(t.text_2)).padding([16, 0]));
     }
 
     for (n, title) in SECTIONS.iter().enumerate() {
-        let rows: Vec<_> = list.rows.iter().enumerate().filter(|(_, r)| section(r, &list.today) == n).collect();
+        let rows: Vec<_> = list
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| section(r, &list.today) == n && list.filter.keeps(r, &list.today))
+            .collect();
         if rows.is_empty() {
             continue;
         }
@@ -238,6 +349,19 @@ mod tests {
         (dir, db)
     }
 
+    #[test]
+    fn followups_are_open_tagged_tasks_linking_the_person() {
+        let (_dir, db) = indexed(&[
+            ("People/john.md", "# John\n"),
+            ("Daily.md", "- [ ] Send deck [[john]] #followup\n- [x] Old [[john]] #followup\n- [ ] Plain [[john]]\n- [ ] Other #followup\n"),
+        ]);
+        let rows = followups(&db, "People/john.md").unwrap();
+        let shown: Vec<(&str, u32)> = rows.iter().map(|r| (r.text.as_str(), r.line)).collect();
+        assert_eq!(shown.len(), 1);
+        assert_eq!(shown[0].1, 0);
+        assert!(shown[0].0.starts_with("Send deck"));
+    }
+
     fn doc(title: &str, status: Option<&str>, due: Option<&str>) -> String {
         let status = status.map(|s| format!("status: {s}\n")).unwrap_or_default();
         let due = due.map(|d| format!("due: {d}\n")).unwrap_or_default();
@@ -310,8 +434,9 @@ mod tests {
                 status: Some("todo".into()),
             }],
             today: String::new(),
+            filter: Filter::All,
         };
-        patch_document(&mut list, "t.md", Some("done"));
+        patch_document(&mut list, "t.md", Some("done"));(&mut list, "t.md", Some("done"));
         assert!(list.rows[0].done);
         assert_eq!(list.rows[0].status.as_deref(), Some("done"));
     }

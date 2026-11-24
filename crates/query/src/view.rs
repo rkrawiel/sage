@@ -340,7 +340,7 @@ fn direction(sort: &Sort) -> &'static str {
 const TASKS: &str = "(
     SELECT id, file_id, path, line, raw, text, state, status, due, scheduled, start, done_on, priority,
            0 AS document
-    FROM v_tasks
+    FROM v_tasks WHERE 1@TRACKED@
     UNION ALL
     SELECT -d.id, d.id, d.path, 0, '', d.title,
            CASE d.status WHEN 'done' THEN 'x' WHEN 'cancelled' THEN '-' ELSE ' ' END,
@@ -385,10 +385,11 @@ fn task_rows(
     };
     params.push(Value::Integer(limit as i64 + 1));
 
+    let tasks = TASKS.replace("@TRACKED@", sage_db::tracked_clause());
     let sql = format!(
         "SELECT t.path, n.name, t.line, t.raw, t.text, t.state, t.status,
                 t.due, t.scheduled, t.start, t.done_on, t.priority, t.document
-         FROM {TASKS} t JOIN v_notes n ON n.id = t.file_id
+         FROM {tasks} t JOIN v_notes n ON n.id = t.file_id
          WHERE {cond}{cancelled}
          ORDER BY {order} LIMIT ?"
     );

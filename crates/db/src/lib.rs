@@ -23,7 +23,22 @@ pub use rusqlite;
 pub const SCHEMA: &str = include_str!("schema.sql");
 /// Bump on any schema change, and whenever the scanner starts producing
 /// different rows. A mismatch rebuilds the index from the vault.
-pub const SCHEMA_VERSION: i32 = 9;
+pub const SCHEMA_VERSION: i32 = 10;
+
+static TRACKED_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the task list and `tasks` and `view` blocks leave out plain
+/// checkboxes. A display choice, kept outside the index, which holds every
+/// checkbox either way.
+pub fn set_tracked_only(on: bool) {
+    TRACKED_ONLY.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// ` AND tracked` while only tracked tasks are wanted, to end a `WHERE` on
+/// `v_tasks`; otherwise nothing.
+pub fn tracked_clause() -> &'static str {
+    if TRACKED_ONLY.load(std::sync::atomic::Ordering::Relaxed) { " AND tracked" } else { "" }
+}
 
 /// Where the index for `vault` is stored.
 pub fn index_path_for(vault: &Path) -> Result<PathBuf> {

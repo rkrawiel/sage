@@ -9,6 +9,9 @@ pub struct Suggestion {
     pub detail: String,
     /// Text inserted for this suggestion, before closing brackets are added.
     pub value: String,
+    /// A natural-language date, written as a link to its day whatever the
+    /// popup it is in.
+    pub date: bool,
 }
 
 const LIMIT: usize = 8;
@@ -19,8 +22,31 @@ pub fn for_context(db: &Connection, ctx: &Context) -> Vec<Suggestion> {
         Kind::Embed => links(db, &ctx.query, false),
         Kind::Tag => tags(db, &ctx.query),
         Kind::Path => paths(db, &ctx.query),
+        Kind::Person => people(db, &ctx.query).map(|mut found| {
+            // Dates follow the people, so `@tomorrow` works in a task too.
+            found.truncate(5);
+            let room = LIMIT - found.len();
+            found.extend(dates(&ctx.query).into_iter().take(room));
+            found
+        }),
+        Kind::Date => Ok(dates(&ctx.query)),
     };
     result.unwrap_or_default()
+}
+
+/// The days a phrase such as `tomorrow` can mean, labelled with the date.
+fn dates(query: &str) -> Vec<Suggestion> {
+    let today = sage_editor::now().date();
+    sage_editor::dates::suggest(query, today)
+        .into_iter()
+        .take(LIMIT)
+        .map(|p| Suggestion {
+            label: p.label,
+            detail: p.date.format("%a %d %b %Y").to_string(),
+            value: p.date.format("%Y-%m-%d").to_string(),
+            date: true,
+        })
+        .collect()
 }
 
 /// Notes first, then attachments, then aliases. Inserted text follows
@@ -54,7 +80,7 @@ fn links(db: &Connection, query: &str, notes_first: bool) -> rusqlite::Result<Ve
         let file = path.rsplit('/').next().unwrap_or(&path);
         let stem = if ext == "md" { file.strip_suffix(".md").unwrap_or(file) } else { file }.to_owned();
         let detail = if title != stem && ext == "md" { format!("{title} · {path}") } else { path };
-        out.push(Suggestion { label: stem, detail, value });
+        out.push(Suggestion { label: stem, detail, value, date: false });
     }
 
     if !query.is_empty() && out.len() < LIMIT {
@@ -72,6 +98,7 @@ fn links(db: &Connection, query: &str, notes_first: bool) -> rusqlite::Result<Ve
                 label: alias.clone(),
                 detail: format!("alias of {path}"),
                 value: format!("{target}|{alias}"),
+                date: false,
             });
         }
     }
@@ -87,6 +114,32 @@ fn link_text(db: &Connection, path: &str, ext: &str, name_key: &str) -> rusqlite
         .unwrap_or(false);
     let shown = if unique { path.rsplit('/').next().unwrap_or(path) } else { path };
     Ok(if ext == "md" { shown.strip_suffix(".md").unwrap_or(shown).to_owned() } else { shown.to_owned() })
+}
+
+/// Notes that are people: a `type: person` property, or a folder called
+/// `People`. Matched by name, title or alias; the most recently changed first.
+fn people(db: &Connection, query: &str) -> rusqlite::Result<Vec<Suggestion>> {
+    let mut stmt = db.prepare_cached(
+        "SELECT f.path, f.title, f.name_key FROM files f
+         WHERE f.ext = 'md'
+           AND (lower(f.parent) = 'people' OR lower(f.parent) LIKE '%/people'
+                OR EXISTS (SELECT 1 FROM frontmatter p WHERE p.file_id = f.id AND p.key = 'type' AND lower(trim(p.value)) = 'person'))
+           AND (?1 = '' OR instr(f.name_key, lower(?1)) > 0 OR instr(lower(f.title), lower(?1)) > 0
+                OR EXISTS (SELECT 1 FROM aliases a WHERE a.file_id = f.id AND instr(a.alias_lc, lower(?1)) > 0))
+         ORDER BY (substr(f.name_key, 1, length(?1)) = lower(?1)) DESC, f.mtime_ns DESC
+         LIMIT 8",
+    )?;
+    let rows = stmt.query_map([query], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (path, title, name_key) = row?;
+        let value = link_text(db, &path, "md", &name_key)?;
+        let file = path.rsplit('/').next().unwrap_or(&path);
+        let stem = file.strip_suffix(".md").unwrap_or(file).to_owned();
+        let detail = if title != stem { format!("{title} · {path}") } else { path };
+        out.push(Suggestion { label: stem, detail, value, date: false });
+    }
+    Ok(out)
 }
 
 /// Prefix matches first, then matches anywhere (so `progress` finds
@@ -106,6 +159,7 @@ fn tags(db: &Connection, query: &str) -> rusqlite::Result<Vec<Suggestion>> {
             label: format!("#{tag}"),
             detail: if notes == 1 { "1 note".into() } else { format!("{notes} notes") },
             value: tag,
+            date: false,
         })
     })
     .collect()
@@ -119,7 +173,7 @@ fn paths(db: &Connection, query: &str) -> rusqlite::Result<Vec<Suggestion>> {
     let rows = stmt.query_map([query], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
     rows.map(|row| {
         let (path, title) = row?;
-        Ok(Suggestion { label: path.clone(), detail: title, value: path })
+        Ok(Suggestion { label: path.clone(), detail: title, value: path, date: false })
     })
     .collect()
 }

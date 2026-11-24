@@ -105,6 +105,8 @@ pub struct BuiltIn {
 /// What the panel shows besides the settings themselves.
 pub struct Ctx<'a> {
     pub settings: &'a Settings,
+    /// The note open in the current tab, if any.
+    pub current_note: Option<&'a str>,
     /// The folder Obsidian's Templates setting names.
     pub obsidian_folder: &'a str,
     /// Every folder in the vault.
@@ -124,6 +126,8 @@ pub struct Ctx<'a> {
     pub fixed: &'static [(&'static str, &'static str)],
     /// The folder of the vault open now.
     pub vault: &'a std::path::Path,
+    /// What the shortcut search box holds.
+    pub filter: &'a str,
     pub t: Tokens,
 }
 
@@ -172,6 +176,20 @@ pub fn view(ctx: Ctx<'_>) -> Element<'_, Message> {
     ));
     page = page.push(hint("Ctrl+Shift+L switches between light and dark. This choice is kept on this computer.".into()));
 
+    // Startup.
+    page = page.push(container(section("STARTUP")).padding(iced::Padding { top: 12.0, ..iced::Padding::ZERO }));
+    page = page.push(labelled(
+        "Note to open at start",
+        row![
+            text(ctx.settings.startup_note.as_deref().unwrap_or("None, the notes left open last time")).size(14).width(Fill),
+            action("Use the open note", false, Message::SettingsStartupNote(ctx.current_note.map(str::to_owned)), t),
+            action("Clear", false, Message::SettingsStartupNote(None), t),
+        ]
+        .spacing(8)
+        .align_y(iced::Center),
+    ));
+    page = page.push(hint("This note opens, alongside the notes left open, whenever Sage starts on this vault.".into()));
+
     // Templates.
     page = page.push(container(section("TEMPLATES")).padding(iced::Padding { top: 12.0, ..iced::Padding::ZERO }));
     let default = Pick { value: String::new(), label: format!("Obsidian's setting: {}/", ctx.obsidian_folder) };
@@ -198,12 +216,32 @@ pub fn view(ctx: Ctx<'_>) -> Element<'_, Message> {
     page = page.push(labelled("New note template", choose(choices, current, Message::SettingsNewNoteTemplate, t)));
     page = page.push(hint("Ctrl+N and the New note button start a note from this template.".into()));
 
+    // Tasks.
+    page = page.push(container(section("TASKS")).padding(iced::Padding { top: 12.0, ..iced::Padding::ZERO }));
+    page = page.push(check(
+        "Follow only marked checkboxes as tasks",
+        ctx.settings.tracked_tasks_only,
+        Message::SettingsTrackedOnly,
+        t,
+    ));
+    page = page.push(hint(
+        "A checkbox counts in the task list and in queries when it has #task or #followup, or a due date. The others stay \
+         plain checklists. New task lines get #task."
+            .into(),
+    ));
+
     // Quick Add.
     page = page.push(container(section("QUICK ADD")).padding(iced::Padding { top: 12.0, ..iced::Padding::ZERO }));
     page = page.push(hint(
         "Run an entry with the + beside the vault name, Ctrl+Shift+N, or by its name in Ctrl+P. {{value}} is asked \
          for when it runs; {{date:YYYY-MM-DD}}, {{time}} and {{title}} work as in templates."
             .into(),
+    ));
+    page = page.push(check(
+        "Add every template from the templates folder to Quick Add",
+        ctx.settings.quick_add_templates.unwrap_or(true),
+        Message::SettingsQuickAddTemplates,
+        t,
     ));
     let templates: Vec<Pick> = std::iter::once(Pick { value: String::new(), label: "No template, an empty note".into() })
         .chain(ctx.templates.iter().map(|path| Pick { value: path.clone(), label: crate::file_stem(path).to_owned() }))
@@ -221,6 +259,11 @@ pub fn view(ctx: Ctx<'_>) -> Element<'_, Message> {
 
     // Shortcuts.
     page = page.push(container(section("SHORTCUTS")).padding(iced::Padding { top: 12.0, ..iced::Padding::ZERO }));
+    page = page.push(input("Search shortcuts", ctx.filter, Message::ShortcutFilter, t));
+    let wanted = ctx.filter.trim().to_lowercase();
+    let matches = |what: &str, keys: &str| {
+        wanted.is_empty() || what.to_lowercase().contains(&wanted) || keys.to_lowercase().contains(&wanted)
+    };
     page = page.push(hint(
         "Click a shortcut to change it, then press the keys. A shortcut needs Ctrl, or is a function key.          Changes are kept in this vault's settings."
             .into(),
@@ -229,13 +272,19 @@ pub fn view(ctx: Ctx<'_>) -> Element<'_, Message> {
         row![container(keys).width(240), text(what).size(14)].spacing(12).align_y(iced::Center).into()
     };
     for (i, built_in) in ctx.built_in.iter().enumerate() {
-        page = page.push(line(rebinder(i, built_in, ctx.recording_built_in == Some(i), t), built_in.what.to_owned()));
+        if matches(&built_in.what, built_in.keys.as_deref().unwrap_or("")) {
+            page = page.push(line(rebinder(i, built_in, ctx.recording_built_in == Some(i), t), built_in.what.to_owned()));
+        }
     }
     for (i, entry) in ctx.settings.quick_add.iter().enumerate() {
-        page = page.push(line(recorder(i, entry, ctx.recording == Some(i), t), format!("Quick add: {}", entry.name())));
+        if matches(&format!("Quick add: {}", entry.name()), "") {
+            page = page.push(line(recorder(i, entry, ctx.recording == Some(i), t), format!("Quick add: {}", entry.name())));
+        }
     }
     for &(keys, what) in ctx.fixed {
-        page = page.push(line(keycap(keys, t), what.to_owned()));
+        if matches(what, keys) {
+            page = page.push(line(keycap(keys, t), what.to_owned()));
+        }
     }
     scrollable(container(page).width(Fill)).height(Fill).into()
 }

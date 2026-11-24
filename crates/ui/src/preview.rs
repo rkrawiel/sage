@@ -423,7 +423,8 @@ pub fn property_editor<'a>(
     menu: Option<usize>,
     hover: Option<(usize, usize)>,
     editing: Option<usize>,
-    new_key: &str,
+    template: bool,
+    new_key: Option<(sage_editor::properties::PropType, &str)>,
     t: Tokens,
 ) -> Element<'a, Message> {
     use sage_editor::properties::{PropType, Value};
@@ -457,7 +458,7 @@ pub fn property_editor<'a>(
                     Some(PropType::Number) => ("", true),
                     _ => ("", false),
                 };
-                iced::widget::text_input(hint, &text)
+                let field = iced::widget::text_input(hint, &text)
                     .id(iced::widget::Id::from(property_id(i, 0)))
                     .on_input(move |s| {
                         // A number takes digits only, so it always reads back as one.
@@ -467,8 +468,22 @@ pub fn property_editor<'a>(
                     .on_submit(Message::PropertySubmit(i, None))
                     .size(14)
                     .padding([3, 6])
-                    .style(move |_, status| theme::input(t, status))
-                    .into()
+                    .style(move |_, status| theme::input(t, status));
+                if matches!(ty, Some(PropType::Date | PropType::DateTime)) {
+                    // In a template this writes a placeholder, so each note made from it gets that day.
+                    let tip = if template { "Today when a note is made from this template" } else { "Today" };
+                    let today = button(iced::widget::text("Today").size(12))
+                        .padding([2, 8])
+                        .style(move |_, status| theme::nav_button(t, false, status))
+                        .on_press(Message::PropertyToday(i));
+                    let today = iced::widget::tooltip(today, iced::widget::text(tip).size(12), iced::widget::tooltip::Position::Bottom)
+                        .gap(4)
+                        .padding(4)
+                        .style(move |_| theme::panel(t));
+                    row![field, today].spacing(6).align_y(iced::Center).into()
+                } else {
+                    field.into()
+                }
             }
             Value::Bool(on) => button(text(if on { "✓ true" } else { "false" }).size(14))
                 .padding([2, 8])
@@ -577,14 +592,38 @@ pub fn property_editor<'a>(
             }
         }
     }
-    let add = iced::widget::text_input("Add property…", new_key)
-        .id(iced::widget::Id::from(NEW_PROPERTY))
-        .on_input(Message::NewPropertyTyped)
-        .on_submit(Message::NewPropertySubmit)
-        .size(13)
-        .padding([3, 6])
-        .style(move |_, status| theme::input(t, status));
-    rows.push(row![container(add).width(Length::FillPortion(1)).max_width(250), space().width(Length::FillPortion(2))].spacing(12).into());
+    let add: Element<'a, Message> = match new_key {
+        None => button(iced::widget::text("+ Add property").size(13))
+            .padding([2, 8])
+            .style(move |_, status| theme::nav_button(t, false, status))
+            .on_press(Message::NewPropertyOpen)
+            .into(),
+        Some((current, name)) => {
+            let field = iced::widget::text_input("Name", name)
+                .id(iced::widget::Id::from(NEW_PROPERTY))
+                .on_input(Message::NewPropertyTyped)
+                .on_submit(Message::NewPropertySubmit)
+                .size(13)
+                .padding([3, 6])
+                .style(move |_, status| theme::input(t, status));
+            let mut kinds = Row::new().spacing(6);
+            for choice in PropType::ALL {
+                kinds = kinds.push(
+                    button(text(format!("{} {}", type_icon(choice), choice.label())).size(12))
+                        .padding([2, 8])
+                        .style(move |_, status| theme::nav_button(t, choice == current, status))
+                        .on_press(Message::NewPropertyType(choice)),
+                );
+            }
+            row![
+                container(field).width(Length::FillPortion(1)).max_width(250),
+                container(kinds.wrap().vertical_spacing(4)).width(Length::FillPortion(2)),
+            ]
+            .spacing(12)
+            .into()
+        }
+    };
+    rows.push(add);
     container(Column::with_children(rows).spacing(4)).padding([10, 14]).width(Fill).style(move |_| theme::panel(t)).into()
 }
 

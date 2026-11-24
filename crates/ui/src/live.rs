@@ -7,6 +7,48 @@
 //! Markdown throughout.
 
 use std::ops::Range;
+use std::collections::HashSet;
+use std::sync::RwLock;
+
+/// The names a link can use to reach a note: every path suffix without its
+/// extension, and every alias, in lowercase. Set by the app from the index so
+/// that links to notes that do not exist can be drawn differently.
+static KNOWN: RwLock<Option<HashSet<String>>> = RwLock::new(None);
+
+pub fn set_known(paths: impl Iterator<Item = String>, aliases: Vec<String>) {
+    let mut names: HashSet<String> = aliases.into_iter().collect();
+    for path in paths {
+        let path = path.to_lowercase();
+        let path = path.strip_suffix(".md").unwrap_or(&path);
+        let mut rest = path;
+        loop {
+            names.insert(rest.to_owned());
+            match rest.split_once('/') {
+                Some((_, tail)) => rest = tail,
+                None => break,
+            }
+        }
+    }
+    if let Ok(mut known) = KNOWN.write() {
+        *known = Some(names);
+    }
+}
+
+/// Whether `target`, the inside of a `[[link]]`, names no note. Unknown until
+/// the index has been read, and never for the note itself (`[[#Heading]]`) or
+/// for an attachment.
+fn is_missing(target: &str) -> bool {
+    let name = target.split(['|', '#']).next().unwrap_or("").trim().to_lowercase();
+    let name = name.trim_end_matches('/');
+    if name.is_empty() || name.rsplit_once('.').is_some_and(|(_, ext)| ext != "md" && ext.len() <= 5) {
+        return false;
+    }
+    let name = name.strip_suffix(".md").unwrap_or(name);
+    match KNOWN.read() {
+        Ok(known) => known.as_ref().is_some_and(|k| !k.contains(name)),
+        Err(_) => false,
+    }
+}
 
 /// Stands in for a task's `- [ ]` while the widget draws a box over it; as
 /// wide as the box.
@@ -45,6 +87,8 @@ pub struct Style {
     pub highlight: bool,
     pub code: bool,
     pub link: bool,
+    /// A link to a note that does not exist; Ctrl+click creates it.
+    pub missing: bool,
     pub tag: bool,
     /// Markdown syntax, shown because the cursor is on it.
     pub syntax: bool,
@@ -360,7 +404,7 @@ fn inline(text: &str, range: Range<usize>, style: Style, at: Option<&Range<usize
                     continue;
                 };
                 let whole = i..close + 2;
-                let linked = Style { link: true, ..style };
+                let linked = Style { link: true, missing: is_missing(&text[inner..close]), ..style };
                 span(out, &mut plain, i..inner, close..close + 2, &mut |out, shown| {
                     let target = &text[inner..close];
                     if shown {
@@ -616,6 +660,19 @@ pub fn to_source(segs: &[Seg], shown: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn links_to_notes_that_do_not_exist_are_missing() {
+        set_known(["People/John.md", "Plan.md"].into_iter().map(str::to_owned), vec!["jo".into()]);
+        assert!(!is_missing("john"));
+        assert!(!is_missing("People/John|Johnny"));
+        assert!(!is_missing("Plan#Goals"));
+        assert!(!is_missing("jo"), "an alias");
+        assert!(!is_missing("#Heading"), "the note itself");
+        assert!(!is_missing("photo.png"), "an attachment");
+        assert!(is_missing("Nobody"));
+        assert!(is_missing("Other/Plan"));
+    }
 
     /// What a one-line note shows with the cursor at `cursor`, if anywhere.
     fn show(text: &str, cursor: Option<usize>) -> String {

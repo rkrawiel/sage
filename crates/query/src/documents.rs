@@ -292,7 +292,7 @@ const ROWS: &str = "
            NULL, t.due,
            (SELECT group_concat(tag, ',') FROM v_tags g WHERE g.file_id = t.file_id AND g.line = t.line),
            NULL
-    FROM v_tasks t";
+    FROM v_tasks t WHERE 1@TRACKED@";
 
 /// Runs a `tasks` block. Date words are relative to `today`.
 pub fn run_tasks(db: &Connection, query: &TaskQuery, today: NaiveDate) -> rusqlite::Result<TaskList> {
@@ -372,8 +372,9 @@ pub fn run_tasks(db: &Connection, query: &TaskQuery, today: NaiveDate) -> rusqli
     order.push("x.text COLLATE NOCASE, x.path, x.line".into());
     params.push(Value::Integer(query.limit as i64 + 1));
 
+    let rows = ROWS.replace("@TRACKED@", sage_db::tracked_clause());
     let sql = format!(
-        "SELECT x.path, x.line, x.raw, x.text, x.status, x.created, x.due, x.tags FROM ({ROWS}) x \
+        "SELECT x.path, x.line, x.raw, x.text, x.status, x.created, x.due, x.tags FROM ({rows}) x \
          WHERE {} ORDER BY {} LIMIT ?{}",
         conds.join(" AND "),
         order.join(", "),
