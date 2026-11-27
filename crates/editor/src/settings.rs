@@ -39,6 +39,14 @@ pub struct Settings {
     /// `"due": "date"`. Obsidian's own `types.json` is read as well; these win.
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub property_types: std::collections::BTreeMap<String, String>,
+    /// Whether task reminders show system notifications; `None`, the
+    /// default, means yes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notifications: Option<bool>,
+    /// When a reminder written with a date only, `(@2026-12-01)`, goes off,
+    /// as `HH:MM`; `None` is 09:00, the Reminder plugin's default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reminder_time: Option<String>,
 }
 
 impl Settings {

@@ -5,8 +5,11 @@
 //! reader of its own; each keystroke then scores in memory. Text is matched word by word through the vault's vocabulary, so
 //! a typo still finds the note while a long body cannot match a query letter
 //! by letter. Every word of the query has to match somewhere in a note.
+//! Each query word's text matches are kept until the next search, so typing
+//! only walks the vocabulary again for the word being typed.
 
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 use rusqlite::Connection;
 
@@ -16,6 +19,23 @@ pub(crate) struct Corpus {
     /// Each lowercase word of the notes' text: the notes it is in, with the
     /// first line it is on.
     words: HashMap<String, Vec<(u32, u32)>>,
+    /// The last search's text matches per query word. The corpus never
+    /// changes once loaded, so they stay right until the next search drops
+    /// the words it no longer has; a mutex, as the corpus is shared in an `Arc`.
+    matched: Mutex<HashMap<String, Matches>>,
+}
+
+/// The notes whose text matches a query word: best score and its line.
+type Matches = HashMap<u32, (i32, u32)>;
+
+/// Buffers reused across the many words one search scores, so matching a
+/// word allocates nothing.
+#[derive(Default)]
+struct Scratch {
+    word: Vec<char>,
+    hay: Vec<char>,
+    /// The rows `distance` keeps: two back, one back and the current one.
+    rows: [Vec<usize>; 3],
 }
 
 struct Note {
@@ -176,18 +196,30 @@ impl Corpus {
         if tokens.is_empty() {
             return Vec::new();
         }
-        let in_text: Vec<HashMap<u32, (i32, u32)>> = tokens.iter().map(|t| self.text_matches(t)).collect();
+        let chars: Vec<Vec<char>> = tokens.iter().map(|t| t.chars().collect()).collect();
+        let mut scratch = Scratch::default();
+        let mut matched = self.matched.lock().unwrap_or_else(|e| e.into_inner());
+        let mut last = std::mem::take(&mut *matched);
+        for (token, chars) in tokens.iter().zip(&chars) {
+            if !matched.contains_key(token) {
+                let found = last.remove(token).unwrap_or_else(|| self.text_matches(token, chars, &mut scratch));
+                matched.insert(token.clone(), found);
+            }
+        }
+        let in_text: Vec<&Matches> = tokens.iter().map(|t| &matched[t]).collect();
 
         let mut scored: Vec<(i32, usize, Place)> = Vec::new();
         'notes: for (i, note) in self.notes.iter().enumerate() {
             let mut total = 0;
             let mut best: Option<(i32, Place)> = None;
-            for (token, text) in tokens.iter().zip(&in_text) {
+            for ((token, chars), text) in tokens.iter().zip(&chars).zip(&in_text) {
                 let field = note
                     .fields
                     .iter()
                     .enumerate()
-                    .filter_map(|(f, field)| Some((field_score(token, &field.lower)? * field.kind.weight() / 10, Place::Field(f))))
+                    .filter_map(|(f, field)| {
+                        Some((field_score(token, chars, &field.lower, &mut scratch)? * field.kind.weight() / 10, Place::Field(f)))
+                    })
                     .max_by_key(|&(score, _)| score);
                 let line = text.get(&(i as u32)).map(|&(score, line)| (score, Place::Line(line)));
                 let Some((score, place)) = [field, line].into_iter().flatten().max_by_key(|&(score, _)| score) else {
@@ -202,9 +234,16 @@ impl Corpus {
                 scored.push((total, i, place));
             }
         }
-        scored.sort_by(|a, b| {
-            b.0.cmp(&a.0).then_with(|| self.notes[a.1].path.len().cmp(&self.notes[b.1].path.len()))
-        });
+        // Only the best `limit` are shown, so only they are sorted; the note's
+        // index breaks the last ties, as a stable sort of them all would.
+        let order = |a: &(i32, usize, Place), b: &(i32, usize, Place)| {
+            b.0.cmp(&a.0).then_with(|| self.notes[a.1].path.len().cmp(&self.notes[b.1].path.len())).then(a.1.cmp(&b.1))
+        };
+        if limit > 0 && scored.len() > limit {
+            scored.select_nth_unstable_by(limit - 1, order);
+            scored.truncate(limit);
+        }
+        scored.sort_by(order);
         scored
             .into_iter()
             .take(limit)
@@ -231,11 +270,10 @@ impl Corpus {
     }
 
     /// The notes whose text has a word matching `token`: best score and its line.
-    fn text_matches(&self, token: &str) -> HashMap<u32, (i32, u32)> {
-        let chars: Vec<char> = token.chars().collect();
-        let mut found: HashMap<u32, (i32, u32)> = HashMap::new();
+    fn text_matches(&self, token: &str, chars: &[char], scratch: &mut Scratch) -> Matches {
+        let mut found: Matches = HashMap::new();
         for (word, postings) in &self.words {
-            let Some(score) = word_score(token, &chars, word) else { continue };
+            let Some(score) = word_score(token, chars, word, scratch) else { continue };
             for &(note, line) in postings {
                 let entry = found.entry(note).or_insert((score, line));
                 if score > entry.0 {
@@ -256,7 +294,7 @@ fn words(line: &str) -> impl Iterator<Item = String> + '_ {
 /// beats substring beats a typo; a word of two letters or less must start the
 /// word, as anything shorter matches nearly everything.
 /// `chars` is `token` as characters, made once per search rather than per word.
-fn word_score(token: &str, chars: &[char], word: &str) -> Option<i32> {
+fn word_score(token: &str, chars: &[char], word: &str, scratch: &mut Scratch) -> Option<i32> {
     if word == token {
         return Some(100);
     }
@@ -266,24 +304,33 @@ fn word_score(token: &str, chars: &[char], word: &str) -> Option<i32> {
     if chars.len() >= 3 && word.contains(token) {
         return Some(65);
     }
-    typo_score(chars, word)
+    typo_score(chars, word, scratch)
 }
 
 /// A word within one or two edits of `token` (two from nine letters), or a
 /// word that starts with such a prefix: what a typo still finds.
-fn typo_score(token: &[char], word: &str) -> Option<i32> {
+fn typo_score(token: &[char], word: &str, scratch: &mut Scratch) -> Option<i32> {
     if token.len() < 4 {
         return None;
     }
     let most = if token.len() >= 9 { 2 } else { 1 };
-    let word: Vec<char> = word.chars().collect();
+    // Both kinds of match need at least `token.len() - most` letters, and a
+    // word has no more letters than bytes: most of the vocabulary stops here.
+    if word.len() + most < token.len() {
+        return None;
+    }
+    // One letter past the longest whole match is enough to tell the two
+    // kinds apart, however long the word is.
+    scratch.word.clear();
+    scratch.word.extend(word.chars().take(token.len() + most + 1));
+    let word = &scratch.word;
     if word.len().abs_diff(token.len()) <= most {
-        if let Some(d) = distance(token, &word, most) {
+        if let Some(d) = distance(token, word, most, &mut scratch.rows) {
             return Some(55 - 15 * d as i32);
         }
     }
     if word.len() > token.len() {
-        if let Some(d) = distance(token, &word[..token.len()], most) {
+        if let Some(d) = distance(token, &word[..token.len()], most, &mut scratch.rows) {
             return Some(45 - 15 * d as i32);
         }
     }
@@ -291,33 +338,44 @@ fn typo_score(token: &[char], word: &str) -> Option<i32> {
 }
 
 /// Edits between `a` and `b`, a swap of neighbours counting as one, if no
-/// more than `most`.
-fn distance(a: &[char], b: &[char], most: usize) -> Option<usize> {
-    let mut rows = vec![(0..=b.len()).collect::<Vec<_>>(); a.len() + 1];
+/// more than `most`. Only the last three rows of the table are kept, in
+/// `rows`, which a search reuses for every word.
+fn distance(a: &[char], b: &[char], most: usize, rows: &mut [Vec<usize>; 3]) -> Option<usize> {
+    for row in rows.iter_mut() {
+        row.clear();
+        row.resize(b.len() + 1, 0);
+    }
+    for (j, d) in rows[1].iter_mut().enumerate() {
+        *d = j;
+    }
     for i in 1..=a.len() {
-        rows[i][0] = i;
+        let [two, one, row] = &mut *rows;
+        row[0] = i;
         let mut least = i;
         for j in 1..=b.len() {
             let cost = usize::from(a[i - 1] != b[j - 1]);
-            let mut d = (rows[i - 1][j] + 1).min(rows[i][j - 1] + 1).min(rows[i - 1][j - 1] + cost);
+            let mut d = (one[j] + 1).min(row[j - 1] + 1).min(one[j - 1] + cost);
             if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
-                d = d.min(rows[i - 2][j - 2] + 1);
+                d = d.min(two[j - 2] + 1);
             }
-            rows[i][j] = d;
+            row[j] = d;
             least = least.min(d);
         }
         if least > most {
             return None;
         }
+        // The current row becomes the one back, and the oldest is reused next.
+        rows.rotate_left(1);
     }
-    let d = rows[a.len()][b.len()];
+    let d = rows[1][b.len()];
     (d <= most).then_some(d)
 }
 
 /// How well a query word matches a short metadata value: whole, start,
 /// substring, letters in order close together (`pjal` finds
 /// `projects/alpha`), or a word of it with a typo.
-fn field_score(token: &str, field: &str) -> Option<i32> {
+/// `chars` is `token` as characters and `field` is already lowercase.
+fn field_score(token: &str, chars: &[char], field: &str, scratch: &mut Scratch) -> Option<i32> {
     if field == token {
         return Some(100);
     }
@@ -328,19 +386,20 @@ fn field_score(token: &str, field: &str) -> Option<i32> {
         let boundary = !field[..at].chars().next_back().is_some_and(char::is_alphanumeric);
         return Some(if boundary { 80 } else { 70 });
     }
-    let chars: Vec<char> = token.chars().collect();
-    let letters = subsequence_score(&chars, field);
-    let typo = words(field).filter_map(|w| typo_score(&chars, &w)).max();
+    let letters = subsequence_score(chars, field, &mut scratch.hay);
+    let typo = field.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).filter_map(|w| typo_score(chars, w, scratch)).max();
     letters.max(typo)
 }
 
 /// The letters of `token` in order in `field`, scored by how tightly they
 /// sit and how many start a word. Too loose a match is no match.
-fn subsequence_score(token: &[char], field: &str) -> Option<i32> {
+fn subsequence_score(token: &[char], field: &str, hay: &mut Vec<char>) -> Option<i32> {
     if token.len() < 2 {
         return None;
     }
-    let hay: Vec<char> = field.chars().collect();
+    hay.clear();
+    hay.extend(field.chars());
+    let hay = &*hay;
     let starts_word = |k: usize| k == 0 || !hay[k - 1].is_alphanumeric();
     let mut best: Option<i32> = None;
     // Greedy from every place the first letter occurs; the tightest wins.
@@ -517,8 +576,68 @@ mod tests {
 
     #[test]
     fn short_words_do_not_match_everything() {
-        assert!(typo_score(&['a', 'b', 'c'], "abd").is_none());
-        assert!(subsequence_score(&['a', 'z'], "a very long value without the letter z at all").is_none());
+        assert!(typo_score(&['a', 'b', 'c'], "abd", &mut Scratch::default()).is_none());
+        assert!(subsequence_score(&['a', 'z'], "a very long value without the letter z at all", &mut Vec::new()).is_none());
+    }
+
+    /// The whole table, as `distance` first kept it, to check the rolling rows against.
+    fn full_distance(a: &[char], b: &[char]) -> usize {
+        let mut rows = vec![(0..=b.len()).collect::<Vec<_>>(); a.len() + 1];
+        for i in 1..=a.len() {
+            rows[i][0] = i;
+            for j in 1..=b.len() {
+                let cost = usize::from(a[i - 1] != b[j - 1]);
+                let mut d = (rows[i - 1][j] + 1).min(rows[i][j - 1] + 1).min(rows[i - 1][j - 1] + cost);
+                if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                    d = d.min(rows[i - 2][j - 2] + 1);
+                }
+                rows[i][j] = d;
+            }
+        }
+        rows[a.len()][b.len()]
+    }
+
+    #[test]
+    fn rolling_rows_count_the_same_edits_as_the_whole_table() {
+        // One set of rows for every pair, as a search reuses them across words of different lengths.
+        let mut rows = Default::default();
+        let pairs = [
+            ("reconnect", "recconect"),
+            ("friday", "frday"),
+            ("form", "from"),
+            ("abcdef", "badcfe"),
+            ("über", "ubre"),
+            ("", "abc"),
+            ("abc", ""),
+            ("kitten", "sitting"),
+            ("distributed", "distribted"),
+        ];
+        for (a, b) in pairs {
+            let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+            let full = full_distance(&a, &b);
+            for most in 0..4 {
+                assert_eq!(distance(&a, &b, most, &mut rows), (full <= most).then_some(full), "{a:?} {b:?} {most}");
+            }
+        }
+        assert_eq!(distance(&['f', 'o', 'r', 'm'], &['f', 'r', 'o', 'm'], 1, &mut rows), Some(1), "a swap is one edit");
+    }
+
+    #[test]
+    fn repeated_searches_reuse_matches_and_still_agree() {
+        let c = corpus();
+        for q in ["alpha", "alpha lau", "alpha launch", "recconect", "alpha launch", "books"] {
+            assert_eq!(names(&c.search(q, 10)), names(&corpus().search(q, 10)), "{q}");
+        }
+        assert_eq!(c.matched.lock().unwrap().len(), 1, "only the last search's words are kept");
+    }
+
+    #[test]
+    fn a_limit_keeps_the_best_in_order() {
+        let c = corpus();
+        let all = c.search("a", 10);
+        assert!(all.len() > 1);
+        assert_eq!(names(&c.search("a", 1)), names(&all[..1]));
+        assert!(c.search("a", 0).is_empty());
     }
 
     #[test]

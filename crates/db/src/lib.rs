@@ -23,7 +23,7 @@ pub use rusqlite;
 pub const SCHEMA: &str = include_str!("schema.sql");
 /// Bump on any schema change, and whenever the scanner starts producing
 /// different rows. A mismatch rebuilds the index from the vault.
-pub const SCHEMA_VERSION: i32 = 10;
+pub const SCHEMA_VERSION: i32 = 13;
 
 static TRACKED_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -106,6 +106,9 @@ fn configure(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     // Losing the last transaction on power failure is fine for a cache.
     conn.pragma_update(None, "synchronous", "NORMAL")?;
+    // A full rebuild grows the log by the whole index; without a limit the file
+    // keeps that size on disk after every checkpoint.
+    conn.pragma_update(None, "journal_size_limit", 67_108_864)?; // 64 MB
     conn.pragma_update(None, "foreign_keys", true)?;
     conn.pragma_update(None, "temp_store", "MEMORY")?;
     conn.pragma_update(None, "cache_size", -32_000)?; // 32 MB

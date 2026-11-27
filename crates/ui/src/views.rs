@@ -179,7 +179,7 @@ fn task_list(tasks: &Tasks, t: Tokens) -> Element<'_, Message> {
 fn card_text(task: &TaskRow) -> String {
     plain_links(&task.text)
         .split_whitespace()
-        .filter(|word| !word.to_lowercase().starts_with("#status/"))
+        .filter(|word| !order::is_status_tag(word))
         .collect::<Vec<_>>()
         .join(" ")
 }

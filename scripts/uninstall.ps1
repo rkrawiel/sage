@@ -46,6 +46,7 @@ Remove-UserKey "$classes\Directory\shell\Sage"
 Remove-UserKey "$classes\Directory\Background\shell\Sage"
 Remove-UserKey "$classes\Sage.Markdown"
 Remove-UserKey "$classes\Applications\sage.exe"
+Remove-UserKey "$classes\AppUserModelId\Sage.Sage"
 Remove-UserKey 'Software\Microsoft\Windows\CurrentVersion\Uninstall\Sage'
 
 # Only Sage's own value; .md and its other "Open with" apps stay.

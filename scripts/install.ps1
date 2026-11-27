@@ -7,6 +7,7 @@
     "Sage" shortcut to the Start menu, and registers, under HKCU only:
       - "Open with Sage" on folders and on a folder's background (opens it as a vault);
       - Sage in the "Open with" list of .md files (never as their default app);
+      - Sage's app id, so its task reminders show as Windows notifications;
       - an entry in Settings > Apps that runs uninstall.ps1.
     Run it again to update Sage. -WhatIf shows every change without making it.
 
@@ -90,6 +91,9 @@ Set-UserValue "$classes\Applications\sage.exe" 'FriendlyAppName' 'Sage'
 Set-UserValue "$classes\Applications\sage.exe\DefaultIcon" '' $icon
 Set-UserValue "$classes\Applications\sage.exe\SupportedTypes" '.md' ''
 Set-UserValue "$classes\Applications\sage.exe\shell\open\command" '' "`"$target`" `"%1`""
+
+# Toasts for task reminders: Windows shows them only for a registered app id.
+Set-UserValue "$classes\AppUserModelId\Sage.Sage" 'DisplayName' 'Sage'
 
 # Settings > Apps.
 $uninstall = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\Sage'

@@ -86,12 +86,13 @@ pub fn context(line: &str, col: usize) -> Option<Context> {
         let starts_word = before[..at].chars().next_back().is_none_or(char::is_whitespace);
         if starts_word && is_task && query.chars().all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.')) {
             let tag = format!("#{FOLLOWUP_TAG}");
+            let waiting = format!("#{}", crate::log::WAITING_TAG);
             return Some(Context {
                 kind: Kind::Person,
                 query: query.to_owned(),
                 start: at,
                 closed: false,
-                tagged: line.split_whitespace().any(|w| w.eq_ignore_ascii_case(&tag)),
+                tagged: line.split_whitespace().any(|w| w.eq_ignore_ascii_case(&tag) || w.eq_ignore_ascii_case(&waiting)),
             });
         }
         // Dates may hold spaces (`next week`), so they are bounded instead.

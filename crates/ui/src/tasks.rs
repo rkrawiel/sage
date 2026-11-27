@@ -1,7 +1,8 @@
 //! The vault-wide task list: open tasks by due date, and what was done today.
 //!
-//! Read from `v_tasks` and `v_documents`: checkbox lines and task documents
-//! (notes with `type: task`). Checking a line rewrites it on disk through
+//! Read from `v_tasks` and `v_documents`: checkbox lines marked as tasks (see
+//! `tracked` in `schema.sql`; plain checklists stay out whatever the vault
+//! setting) and task documents (notes with `type: task`). Checking a line rewrites it on disk through
 //! `sage_editor::tasks`, which refuses when the line no longer matches;
 //! checking a document sets its `status` the same guarded way.
 
@@ -32,19 +33,27 @@ pub enum Filter {
     /// Due today or before.
     Due,
     Followups,
+    /// Tasks waiting on somebody.
+    Waiting,
     /// Without the ones completed today.
     Open,
 }
 
 impl Filter {
-    const ALL: [(Filter, &'static str); 4] =
-        [(Filter::All, "All"), (Filter::Due, "Due or overdue"), (Filter::Followups, "Follow-ups"), (Filter::Open, "Open only")];
+    const ALL: [(Filter, &'static str); 5] = [
+        (Filter::All, "All"),
+        (Filter::Due, "Due or overdue"),
+        (Filter::Followups, "Follow-ups"),
+        (Filter::Waiting, "Waiting"),
+        (Filter::Open, "Open only"),
+    ];
 
     fn keeps(self, row: &TaskRow, today: &str) -> bool {
         match self {
             Filter::All => true,
             Filter::Due => !row.done && row.due.as_deref().is_some_and(|d| d <= today),
             Filter::Followups => row.text.to_lowercase().contains("#followup"),
+            Filter::Waiting => row.text.to_lowercase().contains("#waiting"),
             Filter::Open => !row.done,
         }
     }
@@ -77,8 +86,10 @@ pub fn load(db: &Connection, today: &str) -> rusqlite::Result<Vec<TaskRow>> {
              SELECT path, line, raw, text, due, state IN ('x', 'X') AS done, priority,
                     0 AS document, NULL AS status, NULL AS tags
              FROM v_tasks
-             WHERE (state NOT IN ('x', 'X', '-') OR done_on = ?1)@TRACKED@"
-        .replace("@TRACKED@", sage_db::tracked_clause());
+             WHERE (state NOT IN ('x', 'X', '-') OR done_on = ?1)@TRACKED@
+               AND NOT EXISTS (SELECT 1 FROM links l JOIN v_documents k ON k.id = l.dst_file_id
+                               WHERE l.src_file_id = v_tasks.file_id AND l.line = v_tasks.line AND k.type = 'task')"
+        .replace("@TRACKED@", " AND tracked");
     let mut stmt = db.prepare_cached(&format!(
         "{sql}
              UNION ALL
@@ -114,7 +125,7 @@ pub fn load(db: &Connection, today: &str) -> rusqlite::Result<Vec<TaskRow>> {
     rows.collect()
 }
 
-/// Open tasks tagged `#followup` that link to the note at `path`, oldest
+/// Open tasks tagged `#followup` or `#waiting` that link to the note at `path`, oldest
 /// note first. Done tasks drop out because only the open state matches.
 pub fn followups(db: &Connection, path: &str) -> rusqlite::Result<Vec<TaskRow>> {
     let mut stmt = db.prepare_cached(
@@ -122,17 +133,23 @@ pub fn followups(db: &Connection, path: &str) -> rusqlite::Result<Vec<TaskRow>> 
          JOIN links l ON l.src_file_id = t.file_id AND l.line = t.line
          JOIN files d ON d.id = l.dst_file_id
          JOIN tags g ON g.file_id = t.file_id AND g.line = t.line
-         WHERE d.path = ?1 AND t.state = ' ' AND g.tag = 'followup' AND t.file_id <> d.id
+         WHERE d.path = ?1 AND t.state = ' ' AND g.tag IN ('followup', 'waiting') AND t.file_id <> d.id
          ORDER BY t.path COLLATE NOCASE, t.line
          LIMIT 200",
     )?;
+    let today = sage_editor::today();
     let rows = stmt.query_map([path], |r| {
         let text: String = r.get(3)?;
+        let raw: String = r.get(2)?;
+        let mut shown = plain_links(&sage_core::task_display(&text));
+        if let Some(days) = sage_editor::log::waiting_days(&raw, &today) {
+            shown = format!("{shown} ({days}d)");
+        }
         Ok(TaskRow {
             path: r.get(0)?,
             line: r.get(1)?,
-            raw: r.get(2)?,
-            text: plain_links(&sage_core::task_display(&text)),
+            raw,
+            text: shown,
             due: None,
             done: false,
             document: false,
@@ -166,7 +183,7 @@ pub fn followup_panel(rows: &[TaskRow], t: Tokens) -> Element<'_, Message> {
     }
     container(
         column![
-            text("Follow-ups").size(13).color(t.text_2),
+            text("Follow-ups and waiting").size(13).color(t.text_2),
             scrollable(list).height(iced::Length::Shrink),
         ]
         .spacing(4),
@@ -350,6 +367,19 @@ mod tests {
     }
 
     #[test]
+    fn waiting_tasks_are_tracked_and_show_their_days() {
+        let (_dir, db) = indexed(&[
+            ("People/john.md", "# John\n"),
+            ("Daily.md", "- [ ] Contract [[john]] #waiting ➕ 2020-01-01\n"),
+        ]);
+        let rows = followups(&db, "People/john.md").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].text.starts_with("Contract") && rows[0].text.ends_with("d)"), "{}", rows[0].text);
+        let all = load(&db, &sage_editor::today()).unwrap();
+        assert!(all.iter().any(|r| r.text.starts_with("Contract")), "#waiting makes a task tracked");
+    }
+
+    #[test]
     fn followups_are_open_tagged_tasks_linking_the_person() {
         let (_dir, db) = indexed(&[
             ("People/john.md", "# John\n"),
@@ -378,7 +408,7 @@ mod tests {
             ("Tasks/c.md", &doc("Shipped", Some("done"), Some("2026-11-01"))),
             ("Tasks/d.md", &doc("Dropped", Some("cancelled"), None)),
             ("Notes/p.md", "---\ntype: project\ntitle: Project\nstatus: todo\n---\n"),
-            ("Daily.md", "- [ ] Call vendor 📅 2026-11-19\n- [-] Cancelled line\n"),
+            ("Daily.md", "- [ ] Call vendor 📅 2026-11-19\n- [-] Cancelled line\n- [ ] [[a]]\n"),
         ]);
         let rows = load(&db, &today).unwrap();
         let shown: Vec<(&str, bool, bool)> = rows.iter().map(|r| (r.text.as_str(), r.document, r.done)).collect();

@@ -8,6 +8,12 @@
 //! the same one the source pane edits, with the same actions, so autosave,
 //! completion, find and merging work unchanged. What it does itself: clicks
 //! and drags, moving up and down by what is shown, scrolling, and the caret.
+//!
+//! The app names each text with a revision (`next_revision`), so a layout can
+//! tell the text is unchanged without reading it; then only the lines the
+//! cursor left or reached are worked out again. Rendered blocks are laid out
+//! where they sit in the document and moved by the scroll as they are drawn,
+//! so scrolling lays nothing out again.
 
 use crate::live::{self, Caret, Kind, Line, Seg, Show};
 use crate::theme::{self, Tokens};
@@ -16,12 +22,13 @@ use iced::advanced::graphics::text::Paragraph;
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::text::{self, Paragraph as _, Renderer as _, Span};
 use iced::advanced::widget::{self, operation, tree, Tree, Widget};
-use iced::advanced::{clipboard, mouse, renderer, Clipboard, Renderer as _, Shell};
+use iced::advanced::{clipboard, mouse, renderer, Clipboard, InputMethod, Renderer as _, Shell};
 use iced::alignment;
 use iced::widget::text_editor::{Action, Binding, Content, Cursor, Edit, KeyPress, Motion, Position, Status};
-use iced::{font, keyboard, Background, Border, Color, Element, Font, Length, Pixels, Point, Rectangle, Size, Theme};
+use iced::{font, keyboard, Background, Border, Color, Element, Font, Length, Pixels, Point, Rectangle, Size, Theme, Vector};
 use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 type Renderer = iced::Renderer;
@@ -33,6 +40,14 @@ const MAX_WIDTH: f32 = 688.0;
 /// Room for each `>` bar, and around code.
 const INDENT: f32 = 16.0;
 const CODE_PAD: f32 = 12.0;
+
+/// A number no text has had before. A tab takes a new one whenever its text
+/// changes and passes it to the pane, which lays its lines out again only when
+/// it differs. One counter for every tab, as one pane shows them all in turn.
+pub fn next_revision() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
 
 /// What the pane asks of the app.
 #[derive(Debug, Clone)]
@@ -51,6 +66,8 @@ pub enum Event {
 
 pub struct LiveEditor<'a, Message> {
     content: &'a Content,
+    /// Names `content`'s text; see `next_revision`.
+    revision: u64,
     id: widget::Id,
     t: Tokens,
     /// The current find match as `(line, byte range)`.
@@ -60,7 +77,7 @@ pub struct LiveEditor<'a, Message> {
     /// Blocks drawn as the preview draws them while the cursor is outside
     /// them, by the lines they span: tables, embeds, views, the properties.
     islands: Vec<(Range<usize>, Element<'a, Message>)>,
-    editable: Option<Range<usize>>,
+    editable: Vec<Range<usize>>,
     /// Drawn under the caret, over the text, such as the suggestions.
     popup: Option<Element<'a, Message>>,
 }
@@ -68,6 +85,7 @@ pub struct LiveEditor<'a, Message> {
 impl<'a, Message> LiveEditor<'a, Message> {
     pub fn new(
         content: &'a Content,
+        revision: u64,
         id: &'static str,
         t: Tokens,
         mark: Option<(usize, Range<usize>)>,
@@ -76,13 +94,14 @@ impl<'a, Message> LiveEditor<'a, Message> {
     ) -> Self {
         Self {
             content,
+            revision,
             id: widget::Id::new(id),
             t,
             mark,
             on_event: Box::new(on_event),
             key_binding: Box::new(key_binding),
             islands: Vec::new(),
-            editable: None,
+            editable: Vec::new(),
             popup: None,
         }
     }
@@ -98,7 +117,7 @@ impl<'a, Message> LiveEditor<'a, Message> {
     /// It stays drawn while the cursor merely rests in it, and clicks in it
     /// belong to its own widgets. The cursor never turns it into text, as it
     /// starts on the first line when a note opens; source mode shows it raw.
-    pub fn editable(mut self, lines: Option<Range<usize>>) -> Self {
+    pub fn editable(mut self, lines: Vec<Range<usize>>) -> Self {
         self.editable = lines;
         self
     }
@@ -118,6 +137,8 @@ const ISLAND_GAP: f32 = 8.0;
 struct Laid {
     text: String,
     line: Line,
+    /// What the line before passed on, to work this line out again alone.
+    carry: live::Carry,
     width: f32,
     t: Tokens,
     paragraph: Paragraph,
@@ -154,13 +175,14 @@ struct State {
     caret: Option<Caret>,
     /// Which islands are drawn rendered, rather than as written.
     rendered: Vec<bool>,
-    /// What the lines were last laid out for; with the same text, a layout
-    /// would come out the same.
+    /// What the lines were last laid out for, besides the cursor; with the
+    /// same, only the lines the cursor left or reached can come out different.
     laid_for: Option<LaidFor>,
 }
 
-/// The cursor, the width, the theme and the islands' lines and heights.
-type LaidFor = (Caret, f32, Tokens, Vec<(Range<usize>, f32)>);
+/// The text's revision, the known notes' generation, the width, the theme and
+/// the islands' lines and heights.
+type LaidFor = (u64, u64, f32, Tokens, Vec<(Range<usize>, f32)>);
 
 impl operation::Focusable for State {
     fn is_focused(&self) -> bool {
@@ -196,7 +218,7 @@ fn callout_color(line: &Line, t: Tokens) -> Option<Color> {
 }
 
 /// Lays out one line's paragraph.
-fn lay(text: String, line: Line, width: f32, t: Tokens) -> Laid {
+fn lay(text: String, line: Line, carry: live::Carry, width: f32, t: Tokens) -> Laid {
     let (base, size, height) = metrics(line.kind);
     let (shown, segs) = live::shown(&line, &text);
     let muted = line.done || (line.quotes > 0 && line.callout.is_none());
@@ -257,7 +279,7 @@ fn lay(text: String, line: Line, width: f32, t: Tokens) -> Laid {
         wrapping: text::Wrapping::WordOrGlyph,
     });
     let text_h = paragraph.min_bounds().height.max(size * height);
-    Laid { text, line, width, t, paragraph, segs, text_h, top: 0.0, pad: 0.0, height: text_h, x, hidden: false }
+    Laid { text, line, carry, width, t, paragraph, segs, text_h, top: 0.0, pad: 0.0, height: text_h, x, hidden: false }
 }
 
 /// The cursor and the selection's other end, ordered.
@@ -334,41 +356,92 @@ impl State {
         }
     }
 
-    /// Lays out every line. `islands` are the lines of blocks drawn
-    /// rendered, with the height of their drawing.
-    fn relayout(&mut self, content: &Content, width: f32, t: Tokens, islands: &[(Range<usize>, f32)]) {
+    /// Lays out every line. `revision` names the text: the same number, the
+    /// same text. `islands` are the lines of blocks drawn rendered, with the
+    /// height of their drawing.
+    fn relayout(&mut self, content: &Content, revision: u64, width: f32, t: Tokens, islands: &[(Range<usize>, f32)]) {
         let caret = caret_of(content);
         // Scrolling, the autosave clock and index passes all ask for a layout.
-        // When nothing it depends on changed, comparing the lines is far
-        // cheaper than working out every line's pieces again.
-        let laid_for = (caret, width, t, islands.to_vec());
-        let same = self.laid_for.as_ref() == Some(&laid_for)
-            && content.line_count() == self.lines.len()
-            && content.lines().zip(&self.lines).all(|(line, laid)| *line.text == *laid.text);
-        if same {
+        // With the same text, known notes, width, theme and islands, only the
+        // lines the cursor left or reached can show differently.
+        let laid_for = (revision, live::known_generation(), width, t, islands.to_vec());
+        let moved = self.caret.filter(|old| *old != caret);
+        if self.laid_for.as_ref() != Some(&laid_for) || self.lines.len() != content.line_count() || self.caret.is_none() {
+            self.laid_for = Some(laid_for);
+            self.lay_all(content, caret, width, t);
+        } else if let Some(old) = moved {
+            self.lay_caret(old, caret, width, t);
+        } else {
             self.scroll = self.scroll.clamp(0.0, (self.total - self.viewport).max(0.0));
             return;
         }
-        self.laid_for = Some(laid_for);
-        let texts: Vec<String> = content.lines().map(|l| l.text.into_owned()).collect();
-        let at = caret_pos(content);
-        let lines = live::lines(&texts, Some(caret));
-
-        // Lines that did not change keep their paragraphs, wherever they moved.
-        let mut old: HashMap<String, Vec<Laid>> = HashMap::new();
-        for laid in std::mem::take(&mut self.lines) {
-            old.entry(laid.text.clone()).or_default().push(laid);
+        self.place(islands);
+        if self.caret != Some(caret) {
+            self.caret = Some(caret);
+            self.reveal(caret_pos(content));
         }
-        let mut top = PAD_Y;
-        for (n, (text, line)) in texts.into_iter().zip(lines).enumerate() {
-            let kept = old.get_mut(&text).and_then(|v| {
-                let i = v.iter().position(|l| l.line == line && l.width == width && l.t == t)?;
-                Some(v.swap_remove(i))
-            });
-            let mut laid = match kept {
-                Some(laid) => laid,
-                None => lay(text, line, width, t),
+        self.scroll = self.scroll.clamp(0.0, (self.total - self.viewport).max(0.0));
+    }
+
+    /// Works out every line's pieces again, keeping the paragraphs of the
+    /// lines that come out the same, wherever they moved.
+    fn lay_all(&mut self, content: &Content, caret: Caret, width: f32, t: Tokens) {
+        let texts: Vec<String> = content.lines().map(|l| l.text.into_owned()).collect();
+        let count = texts.len();
+        // An edit leaves the lines before it and after it as they were, so
+        // those are matched by place from both ends; only the lines between
+        // are looked up by their text.
+        let mut old: Vec<Option<Laid>> = std::mem::take(&mut self.lines).into_iter().map(Some).collect();
+        let same = |laid: &Option<Laid>, text: &String| laid.as_ref().is_some_and(|l| l.text == *text);
+        let head = old.iter().zip(&texts).take_while(|(laid, text)| same(laid, text)).count();
+        let tail = old[head..].iter().rev().zip(texts[head..].iter().rev()).take_while(|(laid, text)| same(laid, text)).count();
+        let mut between: HashMap<String, Vec<Laid>> = HashMap::new();
+        let old_count = old.len();
+        for laid in old[head..old_count - tail].iter_mut().filter_map(Option::take) {
+            between.entry(laid.text.clone()).or_default().push(laid);
+        }
+        let fits = |laid: &Laid, line: &Line| laid.line == *line && laid.width == width && laid.t == t;
+        let mut carry = live::Carry::default();
+        for (n, text) in texts.into_iter().enumerate() {
+            let entering = carry.clone();
+            let line = live::next_line(&text, n, &mut carry, Some(caret));
+            let kept = if n < head || n >= count - tail {
+                let i = if n < head { n } else { old_count - (count - n) };
+                old[i].take().filter(|laid| fits(laid, &line))
+            } else {
+                between.get_mut(&text).and_then(|v| {
+                    let i = v.iter().position(|laid| fits(laid, &line))?;
+                    Some(v.swap_remove(i))
+                })
             };
+            self.lines.push(match kept {
+                Some(laid) => Laid { carry: entering, ..laid },
+                None => lay(text, line, entering, width, t),
+            });
+        }
+    }
+
+    /// Works out again only the lines the cursor or selection left or
+    /// reached: with the text unchanged, no other line shows differently.
+    fn lay_caret(&mut self, old: Caret, caret: Caret, width: f32, t: Tokens) {
+        let last = self.lines.len().saturating_sub(1);
+        let left = old.from.0..=old.to.0.min(last);
+        let reached = (caret.from.0..=caret.to.0.min(last)).filter(|n| !left.contains(n));
+        for n in left.clone().chain(reached) {
+            let laid = &mut self.lines[n];
+            let line = live::next_line(&laid.text, n, &mut laid.carry.clone(), Some(caret));
+            if line != laid.line {
+                let text = std::mem::take(&mut laid.text);
+                *laid = lay(text, line, laid.carry.clone(), width, t);
+            }
+        }
+    }
+
+    /// Stacks the lines: each one's room above, height and top, and the
+    /// document's height.
+    fn place(&mut self, islands: &[(Range<usize>, f32)]) {
+        let mut top = PAD_Y;
+        for (n, laid) in self.lines.iter_mut().enumerate() {
             // Headings keep some room above, except at the top.
             laid.pad = if matches!(laid.line.kind, Kind::Heading(_)) && n > 0 { 12.0 } else { 0.0 };
             laid.height = laid.pad + laid.text_h;
@@ -381,15 +454,19 @@ impl State {
             }
             laid.top = top;
             top += laid.height;
-            self.lines.push(laid);
         }
         self.total = top + PAD_Y;
+    }
 
-        if self.caret != Some(caret) {
-            self.caret = Some(caret);
-            self.reveal(at);
-        }
-        self.scroll = self.scroll.clamp(0.0, (self.total - self.viewport).max(0.0));
+    /// How far the rendered blocks, laid out where they sit in the document,
+    /// are moved up on screen: the scroll.
+    fn offset(&self) -> Vector {
+        Vector::new(0.0, self.scroll)
+    }
+
+    /// The pane's bounds as the rendered blocks see them, in the document.
+    fn visible(&self, bounds: Rectangle) -> Rectangle {
+        Rectangle { y: bounds.y + self.scroll, ..bounds }
     }
 
     /// Scrolls just enough to show the cursor.
@@ -544,7 +621,7 @@ impl<Message> Widget<Message, Theme, Renderer> for LiveEditor<'_, Message> {
         let mut heights = Vec::new();
         let mut rendered = Vec::with_capacity(self.islands.len());
         for ((lines, element), child) in self.islands.iter_mut().zip(&mut tree.children) {
-            let editable = self.editable.as_ref() == Some(lines);
+            let editable = self.editable.contains(lines);
             let raw = live::touches_island(lines, caret) && !editable;
             rendered.push(!raw);
             if raw {
@@ -559,11 +636,12 @@ impl<Message> Widget<Message, Theme, Renderer> for LiveEditor<'_, Message> {
         state.left = PAD_X;
         state.viewport = size.height;
         state.rendered = rendered;
-        state.relayout(self.content, width, self.t, &heights);
-        // Placed where their first line is, scrolled.
+        state.relayout(self.content, self.revision, width, self.t, &heights);
+        // Placed where their first line is in the document, not scrolled:
+        // drawing and events move them by the scroll (`State::offset`).
         for ((lines, _), node) in self.islands.iter().zip(&mut nodes) {
             if let Some(laid) = state.lines.get(lines.start) {
-                *node = node.clone().move_to(Point::new(state.left, laid.top + ISLAND_GAP - state.scroll));
+                *node = node.clone().move_to(Point::new(state.left, laid.top + ISLAND_GAP));
             }
         }
         // The popup goes under the caret, or above it at the bottom of the pane.
@@ -607,14 +685,25 @@ impl<Message> Widget<Message, Theme, Renderer> for LiveEditor<'_, Message> {
             }
         }
         // Rendered blocks first: their links, checkboxes and boards. They are
-        // scrolled within the pane, so the pointer counts only inside it.
-        let inner = if cursor.is_over(bounds) { cursor } else { mouse::Cursor::Unavailable };
-        let rendered = tree.state.downcast_ref::<State>().rendered.clone();
+        // scrolled within the pane, so the pointer counts only inside it, and
+        // moves down the document by the scroll as they are laid out there.
+        let (rendered, offset, visible) = {
+            let state = tree.state.downcast_ref::<State>();
+            (state.rendered.clone(), state.offset(), state.visible(bounds))
+        };
+        let inner = if cursor.is_over(bounds) { cursor + offset } else { mouse::Cursor::Unavailable };
+        let had_input_method = shell.input_method().is_enabled();
         for ((((_, element), child), node), shown) in
             self.islands.iter_mut().zip(&mut tree.children).zip(layout.children()).zip(rendered)
         {
             if shown {
-                element.as_widget_mut().update(child, event, node, inner, renderer, clipboard, shell, &bounds);
+                element.as_widget_mut().update(child, event, node, inner, renderer, clipboard, shell, &visible);
+            }
+        }
+        // A field in a block placed its input method in the document; on screen it is scrolled.
+        if !had_input_method {
+            if let InputMethod::Enabled { cursor, .. } = shell.input_method_mut() {
+                *cursor = *cursor - offset;
             }
         }
         if shell.is_event_captured() {
@@ -641,8 +730,11 @@ impl<Message> Widget<Message, Theme, Renderer> for LiveEditor<'_, Message> {
                 let (x, y) = doc(state, p);
                 // Over an editable island, a click that its widgets did not take is theirs alone.
                 let n = state.line_at(y);
-                let over_editable = self.editable.as_ref().is_some_and(|e| e.contains(&n))
-                    && self.islands.iter().zip(&state.rendered).any(|((l, _), shown)| *shown && Some(l) == self.editable.as_ref());
+                let over_editable = self
+                    .islands
+                    .iter()
+                    .zip(&state.rendered)
+                    .any(|((l, _), shown)| *shown && l.contains(&n) && self.editable.contains(l));
                 if over_editable {
                     state.focused = false;
                     shell.capture_event();
@@ -702,8 +794,11 @@ impl<Message> Widget<Message, Theme, Renderer> for LiveEditor<'_, Message> {
                     mouse::ScrollDelta::Pixels { y, .. } => *y,
                 };
                 state.scroll = (state.scroll - dy).clamp(0.0, (state.total - state.viewport).max(0.0));
-                // Rendered blocks are placed by layout, so they move with it.
-                shell.invalidate_layout();
+                // Rendered blocks move with the scroll as they are drawn; only
+                // the popup, placed by the caret on screen, needs a layout.
+                if self.popup.is_some() {
+                    shell.invalidate_layout();
+                }
                 shell.request_redraw();
                 shell.capture_event();
             }
@@ -869,14 +964,17 @@ impl<Message> Widget<Message, Theme, Renderer> for LiveEditor<'_, Message> {
                 }
             }
 
-            // Rendered blocks, over the room their lines left.
-            for ((((_, element), child), node), shown) in
-                self.islands.iter().zip(&tree.children).zip(layout.children()).zip(&state.rendered)
-            {
-                if *shown && node.bounds().intersects(&bounds) {
-                    element.as_widget().draw(child, renderer, theme, style, node, pointer, &bounds);
+            // Rendered blocks, over the room their lines left, moved by the scroll.
+            let visible = state.visible(bounds);
+            renderer.with_translation(Vector::new(0.0, -state.scroll), |renderer| {
+                for ((((_, element), child), node), shown) in
+                    self.islands.iter().zip(&tree.children).zip(layout.children()).zip(&state.rendered)
+                {
+                    if *shown && node.bounds().intersects(&visible) {
+                        element.as_widget().draw(child, renderer, theme, style, node, pointer + state.offset(), &visible);
+                    }
                 }
-            }
+            });
         });
         // The popup, over everything.
         if let Some(popup) = &self.popup {
@@ -906,11 +1004,12 @@ impl<Message> Widget<Message, Theme, Renderer> for LiveEditor<'_, Message> {
                 return popup.as_widget().mouse_interaction(&tree.children[n], node, cursor, &bounds, renderer);
             }
         }
+        let (inner, visible) = (cursor + state.offset(), state.visible(bounds));
         for ((((_, element), child), node), shown) in
             self.islands.iter().zip(&tree.children).zip(layout.children()).zip(&state.rendered)
         {
-            if *shown && cursor.is_over(node.bounds()) {
-                return element.as_widget().mouse_interaction(child, node, cursor, &bounds, renderer);
+            if *shown && inner.is_over(node.bounds()) {
+                return element.as_widget().mouse_interaction(child, node, inner, &visible, renderer);
             }
         }
         match state.hit(p.x - bounds.x - state.left, p.y - bounds.y + state.scroll) {
@@ -927,8 +1026,12 @@ impl<Message> Widget<Message, Theme, Renderer> for LiveEditor<'_, Message> {
         viewport: &Rectangle,
         translation: iced::Vector,
     ) -> Option<iced::advanced::overlay::Element<'b, Message, Theme, Renderer>> {
-        // The menus and tooltips of the drawn blocks, such as a property's type list.
-        let shown = tree.state.downcast_ref::<State>().rendered.clone();
+        // The menus and tooltips of the drawn blocks, such as a property's type
+        // list, moved by the scroll as the blocks are.
+        let (shown, offset) = {
+            let state = tree.state.downcast_ref::<State>();
+            (state.rendered.clone(), state.offset())
+        };
         let overlays: Vec<_> = self
             .islands
             .iter_mut()
@@ -936,7 +1039,9 @@ impl<Message> Widget<Message, Theme, Renderer> for LiveEditor<'_, Message> {
             .zip(layout.children())
             .zip(shown)
             .filter(|(_, shown)| *shown)
-            .filter_map(|((((_, element), child), node), _)| element.as_widget_mut().overlay(child, node, renderer, viewport, translation))
+            .filter_map(|((((_, element), child), node), _)| {
+                element.as_widget_mut().overlay(child, node, renderer, viewport, translation - offset)
+            })
             .collect();
         (!overlays.is_empty()).then(|| iced::advanced::overlay::Group::with_children(overlays).overlay())
     }
@@ -1040,8 +1145,49 @@ mod tests {
         let mut content = Content::with_text(text);
         content.move_to(Cursor { position: Position { line: at.0, column: at.1 }, selection: None });
         let mut state = State { viewport: 600.0, ..State::default() };
-        state.relayout(&content, 600.0, Tokens::LIGHT, &[]);
+        state.relayout(&content, next_revision(), 600.0, Tokens::LIGHT, &[]);
         state
+    }
+
+    /// What a layout decided for each line, to compare two layouts by.
+    fn decided(state: &State) -> Vec<(String, Line, live::Carry, f32, f32)> {
+        state.lines.iter().map(|l| (l.text.clone(), l.line.clone(), l.carry.clone(), l.top, l.height)).collect()
+    }
+
+    #[test]
+    fn moving_the_cursor_lays_out_as_a_fresh_layout_would() {
+        let text = "# Title\n**bold** and [[Link|alias]]\n> [!note] Callout\n> body `code`\n\n- [ ] task\n```\n# code\n```\nlast";
+        let mut state = laid(text, (0, 0));
+        let mut content = Content::with_text(text);
+        let revision = next_revision();
+        let at = |line, column| Position { line, column };
+        let moves = [
+            Cursor { position: at(1, 3), selection: None },
+            Cursor { position: at(3, 8), selection: None },
+            Cursor { position: at(5, 2), selection: Some(at(0, 1)) },
+            Cursor { position: at(7, 0), selection: None },
+            Cursor { position: at(9, 2), selection: None },
+            Cursor { position: at(0, 0), selection: None },
+        ];
+        for cursor in moves {
+            content.move_to(cursor);
+            state.relayout(&content, revision, 600.0, Tokens::LIGHT, &[]);
+            let mut fresh = State { viewport: 600.0, ..State::default() };
+            fresh.relayout(&content, next_revision(), 600.0, Tokens::LIGHT, &[]);
+            assert_eq!(decided(&state), decided(&fresh), "{cursor:?}");
+        }
+    }
+
+    #[test]
+    fn a_new_revision_lays_out_the_new_text() {
+        let mut state = laid("one\ntwo", (0, 0));
+        let mut content = Content::with_text("one\n**three**\ntwo");
+        content.move_to(Cursor { position: Position { line: 0, column: 0 }, selection: None });
+        state.relayout(&content, next_revision(), 600.0, Tokens::LIGHT, &[]);
+        let texts: Vec<&str> = state.lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts, ["one", "**three**", "two"]);
+        let (shown, _) = live::shown(&state.lines[1].line, &state.lines[1].text);
+        assert_eq!(shown, "three", "away from the cursor, the stars are hidden");
     }
 
     fn middle(state: &State, at: Position) -> (f32, f32) {

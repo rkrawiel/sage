@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 anyhow = "1.0.104"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 iced = { version = "0.14.0", features = ["advanced", "tokio", "image-without-codecs", "svg"] }
 # The image formats embeds can show; iced's `image` feature would pull in every codec.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
@@ -30,5 +31,6 @@ tempfile = "3"
 
 # Opening links with the shell, and the folder picker for another vault.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_System_Registry"] }
 rfd = "0.15"
+tauri-winrt-notification = "0.8.1"

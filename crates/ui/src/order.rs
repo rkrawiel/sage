@@ -18,8 +18,14 @@ pub struct Order {
 /// What identifies a card across moves: its note and its text, without the
 /// `#status/` tag a move rewrites. The text of a [`TaskRow`] has no dates.
 pub fn card_key(path: &str, text: &str) -> String {
-    let words: Vec<&str> = text.split_whitespace().filter(|w| !w.to_lowercase().starts_with("#status/")).collect();
+    let words: Vec<&str> = text.split_whitespace().filter(|w| !is_status_tag(w)).collect();
     format!("{path}\n{}", words.join(" "))
+}
+
+/// Whether a word is a `#status/` tag, in any case. Compared without making
+/// the word lowercase, as every word of every card is asked on every frame.
+pub fn is_status_tag(word: &str) -> bool {
+    word.get(..8).is_some_and(|start| start.eq_ignore_ascii_case("#status/"))
 }
 
 pub fn row_key(row: &TaskRow) -> String {
@@ -43,16 +49,17 @@ impl Order {
     /// others after them in the order they came.
     pub fn apply(&self, board: &mut Board) {
         for column in &mut board.columns {
+            // Each card's rank is looked up once, not on every comparison.
+            let mut ranked: Vec<(Option<f64>, TaskRow)> =
+                std::mem::take(&mut column.cards).into_iter().map(|card| (self.ranks.get(&row_key(&card)).copied(), card)).collect();
             // A stable sort keeps the board's order among unranked cards.
-            column.cards.sort_by(|a, b| {
-                let (a, b) = (self.ranks.get(&row_key(a)), self.ranks.get(&row_key(b)));
-                match (a, b) {
-                    (Some(a), Some(b)) => a.total_cmp(b),
-                    (Some(_), None) => std::cmp::Ordering::Less,
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (None, None) => std::cmp::Ordering::Equal,
-                }
+            ranked.sort_by(|(a, _), (b, _)| match (a, b) {
+                (Some(a), Some(b)) => a.total_cmp(b),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
             });
+            column.cards = ranked.into_iter().map(|(_, card)| card).collect();
         }
     }
 
@@ -112,6 +119,17 @@ mod tests {
             priority: None,
             document: false,
         }
+    }
+
+    #[test]
+    fn status_tags_are_found_in_any_case() {
+        for word in ["#status/doing", "#Status/Done", "#STATUS/x", "#status/"] {
+            assert!(is_status_tag(word), "{word}");
+        }
+        for word in ["#status", "status/doing", "#statusx/doing", "#stätus/a", "", "#tag"] {
+            assert!(!is_status_tag(word), "{word}");
+        }
+        assert_eq!(card_key("n.md", "Ship it #Status/Doing now"), "n.md\nShip it now");
     }
 
     fn texts(board: &Board) -> Vec<&str> {

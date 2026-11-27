@@ -1,8 +1,9 @@
--- Sage index schema, version 7 (2: links include Markdown links and wikilinks
+-- Sage index schema, version 13 (2: links include Markdown links and wikilinks
 -- in frontmatter properties; 3: v_tags, v_properties, v_notes.name and .modified;
 -- 4: files.cloud, texts, v_notes.cloud; 5: files.id_key, v_documents; 6: v_tags.line;
 -- 7: escaped pipes in table links, and code fences found as Obsidian finds them;
--- 8: files.status_key, which v_documents.status reads; 9: tags_file covers line).
+-- 8: files.status_key, which v_documents.status reads; 9: tags_file covers line;
+-- 10 to 12: see PLAN.md section 4; 13: tasks.reminder, v_tasks.reminder, v_documents.reminder).
 --
 -- The index is a cache. Everything here is derived from the vault and can be
 -- rebuilt from scratch, so a version bump drops and recreates the database
@@ -34,7 +35,6 @@ CREATE TABLE files (
 CREATE INDEX files_name_key ON files (name_key);
 CREATE INDEX files_id_key   ON files (id_key) WHERE id_key IS NOT NULL;
 CREATE INDEX files_parent   ON files (parent);
-CREATE INDEX files_hash     ON files (hash) WHERE hash IS NOT NULL;
 
 -- Flattened YAML frontmatter: one row per scalar. Lists repeat the key with
 -- increasing ord, nested maps use dotted keys.
@@ -115,11 +115,13 @@ CREATE TABLE tasks (
     scheduled TEXT,
     start     TEXT,
     done_on   TEXT,
-    priority  INTEGER                    -- 5 highest .. 1 lowest
+    priority  INTEGER,                   -- 5 highest .. 1 lowest
+    reminder  TEXT                       -- 'YYYY-MM-DD HH:MM', or 'YYYY-MM-DD' for the default time
 );
 CREATE INDEX tasks_file   ON tasks (file_id, line);
 CREATE INDEX tasks_status ON tasks (status);
 CREATE INDEX tasks_due    ON tasks (due) WHERE due IS NOT NULL;
+CREATE INDEX tasks_remind ON tasks (reminder) WHERE reminder IS NOT NULL;
 
 -- Each note's text as last read, which every row above was derived from. A
 -- write to a note no tab holds, like a task checked in a view, is made to this
@@ -184,11 +186,13 @@ SELECT t.id,
        t.start,
        t.done_on,
        t.priority,
+       t.reminder,
        -- Whether the line is a task to follow globally: tagged #task or
-       -- #followup, or given a due date. Plain checkboxes are checklists.
-       (t.due IS NOT NULL
+       -- #followup, #waiting, or given a due date or a reminder. Plain checkboxes are checklists.
+       -- Tags are stored lowercase, so they are compared as they are.
+       (t.due IS NOT NULL OR t.reminder IS NOT NULL
         OR EXISTS (SELECT 1 FROM tags g WHERE g.file_id = t.file_id AND g.line = t.line
-                   AND lower(g.tag) IN ('task', 'followup'))) AS tracked
+                   AND g.tag IN ('task', 'followup', 'waiting'))) AS tracked
 FROM tasks t
 JOIN files f ON f.id = t.file_id;
 
@@ -223,6 +227,8 @@ SELECT n.id,
         WHERE file_id = n.id AND key = 'created' AND ord = 0)    AS created,
        (SELECT value FROM frontmatter
         WHERE file_id = n.id AND key = 'due' AND ord = 0)        AS due,
+       (SELECT value FROM frontmatter
+        WHERE file_id = n.id AND key = 'reminder' AND ord = 0)   AS reminder,
        (SELECT group_concat(tag, ',') FROM (SELECT tag FROM tags
         WHERE file_id = n.id AND line = 0 ORDER BY rowid))       AS tags
 FROM v_notes n

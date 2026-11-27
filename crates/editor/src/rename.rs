@@ -9,7 +9,7 @@
 use crate::{merge, save_guarded};
 use sage_core::{LineEdit, Link};
 use sage_watcher::Backend;
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -182,18 +182,17 @@ pub fn undo(vault: &Path, rename: &Rename, backend: Backend) -> Result<Vec<(Stri
 fn plan(vault: &Path, db: &Connection, from: &str, to: &str, folder: bool) -> rusqlite::Result<(Vec<Rewrite>, usize)> {
     let moves = |path: &str| map_path(from, to, folder, path);
 
-    // What moves, as `(id, path)`. A note may not be indexed yet.
-    let moving: Vec<(Option<i64>, String)> = if folder {
-        let mut stmt = db.prepare("SELECT id, path FROM files WHERE substr(path, 1, length(?1)) = ?1")?;
-        let rows = stmt.query_map([format!("{from}/")], |r| Ok((Some(r.get(0)?), r.get(1)?)))?;
+    // What moves. A note may not be indexed yet.
+    let moving: Vec<String> = if folder {
+        let mut stmt = db.prepare("SELECT path FROM files WHERE substr(path, 1, length(?1)) = ?1")?;
+        let rows = stmt.query_map([format!("{from}/")], |r| r.get(0))?;
         rows.collect::<Result<_, _>>()?
     } else {
-        let id = db.query_row("SELECT id FROM files WHERE path = ?1", [from], |r| r.get(0)).optional()?;
-        vec![(id, from.to_owned())]
+        vec![from.to_owned()]
     };
     // Names that get a new holder: a renamed note's new name.
     let mut arriving: HashMap<String, Vec<String>> = HashMap::new();
-    for (_, path) in &moving {
+    for path in &moving {
         let after = moves(path).expect("it moves");
         if sage_core::name_key(&after) != sage_core::name_key(path) {
             arriving.entry(sage_core::name_key(&after)).or_default().push(after);
@@ -202,19 +201,18 @@ fn plan(vault: &Path, db: &Connection, from: &str, to: &str, folder: bool) -> ru
 
     // The notes that move, for their own relative links, then every note that
     // links to what moves or to another file with one of its names.
-    let mut sources: Vec<String> = moving.iter().map(|(_, p)| p.clone()).filter(|p| is_note(p)).collect();
+    let mut sources: Vec<String> = moving.iter().filter(|p| is_note(p)).cloned().collect();
     if !folder && !sources.contains(&from.to_owned()) {
         sources.push(from.to_owned());
     }
     let mut names: HashSet<String> = arriving.keys().cloned().collect();
-    names.extend(moving.iter().map(|(_, p)| sage_core::name_key(p)));
-    let mut stmt = db.prepare_cached(
-        "SELECT DISTINCT s.path FROM links l JOIN files s ON s.id = l.src_file_id WHERE l.dst_file_id = ?1",
-    )?;
-    let mut linking = Vec::new();
-    for (id, _) in moving.iter().filter(|(id, _)| id.is_some()) {
-        linking.extend(stmt.query_map([id], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?);
-    }
+    names.extend(moving.iter().map(|p| sage_core::name_key(p)));
+    // Links into what moves, in one query rather than one per moved file.
+    let (moved, key) = if folder { ("substr(d.path, 1, length(?1)) = ?1", format!("{from}/")) } else { ("d.path = ?1", from.to_owned()) };
+    let mut stmt = db.prepare(&format!(
+        "SELECT DISTINCT s.path FROM links l JOIN files s ON s.id = l.src_file_id JOIN files d ON d.id = l.dst_file_id WHERE {moved}"
+    ))?;
+    let mut linking: Vec<String> = stmt.query_map([key], |r| r.get(0))?.collect::<Result<_, _>>()?;
     let mut stmt = db.prepare_cached(
         "SELECT DISTINCT s.path FROM links l JOIN files s ON s.id = l.src_file_id
          WHERE l.target_name = ?1 AND l.dst_file_id IS NOT NULL",
@@ -222,8 +220,11 @@ fn plan(vault: &Path, db: &Connection, from: &str, to: &str, folder: bool) -> ru
     for name in &names {
         linking.extend(stmt.query_map([name], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?);
     }
+    // A set beside the list, which keeps its order: a big vault can have
+    // thousands of linking notes, and a list lookup for each is quadratic.
+    let mut seen: HashSet<String> = sources.iter().cloned().collect();
     for path in linking {
-        if !sources.contains(&path) {
+        if seen.insert(path.clone()) {
             sources.push(path);
         }
     }
@@ -395,7 +396,7 @@ impl Step<'_> {
             Step::Move { from, to, .. } => {
                 // rename(2) replaces an existing target, so check right before.
                 self.check(vault)?;
-                std::fs::rename(vault.join(from), vault.join(to)).map_err(|e| format!("moving {from}: {e}"))
+                crate::rename_over(&vault.join(from), &vault.join(to)).map_err(|e| format!("moving {from}: {e}"))
             }
         }
     }
@@ -409,13 +410,16 @@ impl Step<'_> {
 }
 
 /// Runs `steps` in order. If one fails, the ones already done are reversed.
+/// Steps that cannot be reversed are named in the error, since the vault is
+/// then left half-renamed and the user has to finish by hand.
 fn run(vault: &Path, steps: &[Step], backend: Backend) -> Result<(), String> {
     for (i, step) in steps.iter().enumerate() {
         if let Err(e) = step.perform(vault, backend) {
-            for done in steps[..i].iter().rev() {
-                let _ = done.inverse().perform(vault, backend);
+            let stuck: Vec<String> = steps[..i].iter().rev().filter_map(|done| done.inverse().perform(vault, backend).err()).collect();
+            if stuck.is_empty() {
+                return Err(e);
             }
-            return Err(e);
+            return Err(format!("{e}; undoing the steps before it also failed, so the vault is partly renamed: {}", stuck.join("; ")));
         }
     }
     Ok(())
@@ -566,6 +570,21 @@ mod tests {
         assert!(restored.contains(&("Home.md".to_owned(), format!("# Added on top\n\n{HOME}"))));
         assert!(restored.iter().any(|(path, _)| path == "Projects/Alpha.md"), "paths are the ones before the rename");
         assert!(!f.vault.join("Journal").exists(), "folders created for the move are removed");
+    }
+
+    #[test]
+    fn a_rollback_that_fails_is_reported_with_the_original_error() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.md"), "a").unwrap();
+        // Undoing the write leaves an empty a.md behind, which then blocks
+        // moving b.md back.
+        let steps = [
+            Step::Move { from: "a.md", to: "b.md", folder: false },
+            Step::Write { path: "a.md", old: "", new: "new" },
+            Step::Move { from: "missing.md", to: "c.md", folder: false },
+        ];
+        let err = run(dir.path(), &steps, Backend::Native).unwrap_err();
+        assert!(err.starts_with("missing.md no longer exists") && err.contains("a.md already exists"), "{err}");
     }
 
     #[test]

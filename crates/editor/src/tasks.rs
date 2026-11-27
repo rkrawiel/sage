@@ -35,6 +35,41 @@ fn with_next(raw: &str, changed: String, today: &str) -> Vec<String> {
     }
 }
 
+/// The targets of the links on checkbox lines that `new` has checked and
+/// `old` had open, line for line. A checkbox that links a task note stands
+/// for it, so checking the line closes the note. Empty when the line counts
+/// differ, as lines then cannot be paired up.
+pub fn checked_links(old: &str, new: &str) -> Vec<String> {
+    let (old, new): (Vec<&str>, Vec<&str>) = (old.lines().collect(), new.lines().collect());
+    if old.len() != new.len() {
+        return Vec::new();
+    }
+    let state = |line: &str| sage_core::parse(line).tasks.first().map(|t| t.state);
+    let checked = |s: Option<char>| matches!(s, Some('x' | 'X'));
+    let mut targets = Vec::new();
+    for (before, after) in old.iter().zip(&new) {
+        if before == after || checked(state(before)) || !checked(state(after)) {
+            continue;
+        }
+        targets.extend(sage_core::parse(after).links.into_iter().filter(|l| !l.embed && !l.target.is_empty()).map(|l| l.target));
+    }
+    targets
+}
+
+/// Closes the task note at `path`: its `status` becomes `done`, unless it is
+/// `done` or `cancelled` already or the note has no frontmatter. Returns
+/// whether the note was changed.
+pub fn close_document(path: &Path, backend: Backend) -> Result<bool, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let status = status_of(&text);
+    if matches!(status.as_deref(), Some("done" | "cancelled")) {
+        return Ok(false);
+    }
+    let Some(updated) = with_status(&text, TaskStatus::Done.slug()) else { return Ok(false) };
+    save_guarded(path, &text, &updated, backend).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
 /// Toggles the task on `line` of the note at `path`, but only if that line still
 /// reads `raw`, or read `raw` in `base`, the text the index last read: a stale
 /// line number must never rewrite the wrong line. Returns the note's new text.
@@ -185,6 +220,21 @@ pub fn set_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checking_a_linked_checkbox_closes_the_task_note() {
+        let old = "- [ ] [[T-1]] 📅 2026-12-01\n- [x] [[T-2]]\n- [ ] ![[pic]]\n- [ ] [[T-3]]\n";
+        let new = "- [x] [[T-1]] 📅 2026-12-01\n- [x] [[T-2]]\n- [x] ![[pic]]\n- [ ] [[T-3]]\n";
+        assert_eq!(checked_links(old, new), ["T-1"]);
+        assert!(checked_links(old, "- [x] [[T-1]]\n").is_empty(), "lines that cannot be paired up are left alone");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.md");
+        std::fs::write(&path, "---\nid: T-1\ntype: task\nstatus: doing\n---\nBody\n").unwrap();
+        assert!(close_document(&path, Backend::Native).unwrap());
+        assert_eq!(status_of(&std::fs::read_to_string(&path).unwrap()).as_deref(), Some("done"));
+        assert!(!close_document(&path, Backend::Native).unwrap(), "a closed note is not written again");
+    }
 
     #[test]
     fn toggles_only_the_line_it_was_given() {

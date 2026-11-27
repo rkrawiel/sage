@@ -81,6 +81,9 @@ pub struct Task {
     pub done: Option<String>,
     /// 5 highest .. 1 lowest, `None` when unset.
     pub priority: Option<u8>,
+    /// When to notify, from the Reminder plugin's `(@2026-12-01 09:30)`:
+    /// `YYYY-MM-DD HH:MM`, or `YYYY-MM-DD` for the default time.
+    pub reminder: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -117,24 +120,30 @@ static TASK: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^((?:\s*>)*\s*)(?:[-*+]|\d+[.)])\s\[(.)\]\s+(.*)$").unwrap());
 static HEADING: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(#{1,6})\s+(.+?)\s*#*\s*$").unwrap());
+/// Dates are ASCII digits only: `\d` is Unicode in Rust's regex, and would
+/// take fullwidth or Arabic-Indic digits for a date no other tool can read.
 static EMOJI_DATE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(📅|⏳|🛫|✅)\s*(\d{4}-\d{2}-\d{2})").unwrap());
+    LazyLock::new(|| Regex::new(r"(📅|⏳|🛫|✅)\s*([0-9]{4}-[0-9]{2}-[0-9]{2})").unwrap());
 static INLINE_FIELD: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[\[\(]([A-Za-z_][\w\-]*)::\s*([^\]\)]+)[\]\)]").unwrap());
 /// A completion date in either format, with the space before it.
 static DONE_DATE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\s*(?:✅\s*\d{4}-\d{2}-\d{2}|[\[\(](?:completion|done)::[^\]\)]*[\]\)])").unwrap()
+    Regex::new(r"\s*(?:✅\s*[0-9]{4}-[0-9]{2}-[0-9]{2}|[\[\(](?:completion|done)::[^\]\)]*[\]\)])").unwrap()
 });
 /// Due and completion dates, which a task list shows in columns of their own.
 static DATE_META: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\s*(?:(?:📅|✅)\s*\d{4}-\d{2}-\d{2}|[\[\(](?:due|completion|done)::[^\]\)]*[\]\)])").unwrap()
+    Regex::new(r"\s*(?:(?:📅|✅)\s*[0-9]{4}-[0-9]{2}-[0-9]{2}|[\[\(](?:due|completion|done)::[^\]\)]*[\]\)])").unwrap()
+});
+/// The Obsidian Reminder plugin's `(@2026-12-01)` or `(@2026-12-01 09:30)`.
+static REMINDER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\(@([0-9]{4}-[0-9]{2}-[0-9]{2})(?:[ T]((?:[01][0-9]|2[0-3]):[0-5][0-9]))?\)").unwrap()
 });
 static BLOCK_ID: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s\^[A-Za-z0-9\-]+\s*$").unwrap());
 static STATUS_TAG: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\s#status/[\p{L}\p{N}_/\-]+").unwrap());
 /// Where a task's trailing metadata begins: an emoji signifier, an inline
-/// field, or a block id. Tags go before it so the Tasks plugin still reads it.
+/// field, a reminder or a block id. Tags go before it so the Tasks plugin still reads it.
 static META_START: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\s(?:📅|⏳|🛫|✅|➕|🔺|⏫|🔼|🔽|⏬|🔁|[\[\(][A-Za-z_][\w\-]*::|\^[A-Za-z0-9\-]+\s*$)").unwrap()
+    Regex::new(r"\s(?:📅|⏳|🛫|✅|➕|🔺|⏫|🔼|🔽|⏬|🔁|[\[\(][A-Za-z_][\w\-]*::|\(@[0-9]|\^[A-Za-z0-9\-]+\s*$)").unwrap()
 });
 
 /// Splits `---` delimited YAML frontmatter off the top of a note.
@@ -236,6 +245,7 @@ pub fn parse(src: &str) -> ParsedNote {
                 start: None,
                 done: None,
                 priority: None,
+                reminder: None,
             };
             parse_task_metadata(&mut task);
             note.tasks.push(task);
@@ -488,9 +498,10 @@ pub fn toggle_task(line: &str, today: &str) -> Option<String> {
 }
 
 /// Task text without the due and completion dates, for lists that show those
-/// in columns of their own.
+/// in columns of their own, and without its reminder.
 pub fn task_display(text: &str) -> String {
-    DATE_META.replace_all(text, "").trim().to_owned()
+    let text = DATE_META.replace_all(text, "");
+    REMINDER.replace_all(&text, "").split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Rewrites a task line for a Kanban move. `#status/<slug>` replaces the line's
@@ -641,6 +652,10 @@ pub fn edit_lines(src: &str, edits: &[LineEdit]) -> Option<String> {
 /// Reads both the Tasks-plugin emoji format and Dataview inline fields.
 /// The app only ever writes the emoji format.
 fn parse_task_metadata(task: &mut Task) {
+    task.reminder = REMINDER.captures(&task.text).map(|c| match c.get(2) {
+        Some(time) => format!("{} {}", &c[1], time.as_str()),
+        None => c[1].to_owned(),
+    });
     for c in EMOJI_DATE.captures_iter(&task.text) {
         let date = Some(c[2].to_owned());
         match &c[1] {
@@ -819,6 +834,13 @@ mod tests {
     }
 
     #[test]
+    fn task_dates_in_non_ascii_digits_are_not_read() {
+        let n = parse("- [ ] a 📅 ２０２６-11-26\n- [x] b ✅ ٢٠٢٦-١١-٢٦\n");
+        assert_eq!((n.tasks[0].due.as_deref(), n.tasks[1].done.as_deref()), (None, None));
+        assert_eq!(task_display("a 📅 ２０２６-11-26"), "a 📅 ２０２６-11-26");
+    }
+
+    #[test]
     fn no_frontmatter_and_broken_yaml() {
         assert_eq!(parse("# T\n[[A]]").links[0].line, 1);
         let n = parse("---\n: : [\n---\nbody #x");
@@ -889,6 +911,27 @@ mod tests {
         assert_eq!(parse("> [!todo]\n> - [ ] Quoted #status/doing\n").tasks[0].status.as_deref(), Some("doing"));
         assert!(toggle_task("- not a task", today).is_none());
         assert_eq!(task_display("Ship #status/x 📅 2026-12-01 ⏫ ✅ 2026-11-13"), "Ship #status/x ⏫");
+    }
+
+    #[test]
+    fn reminders_in_the_reminder_plugins_format() {
+        let tasks = parse(
+            "- [ ] Call Anna 📅 2026-12-01 (@2026-12-01 09:30) #task
+- [ ] Pay (@2026-12-02)
+             - [ ] Odd (@2026-12-02 25:00)
+- [ ] Mail (@ann) [due:: 2026-12-03]
+",
+        )
+        .tasks;
+        let reminders: Vec<_> = tasks.iter().map(|t| t.reminder.as_deref()).collect();
+        assert_eq!(reminders, [Some("2026-12-01 09:30"), Some("2026-12-02"), None, None]);
+        assert_eq!(tasks[3].due.as_deref(), Some("2026-12-03"));
+        assert_eq!(task_display("Call Anna 📅 2026-12-01 (@2026-12-01 09:30) #task"), "Call Anna #task");
+        // The status tag goes before the reminder, as before any other metadata.
+        assert_eq!(
+            set_task_column("- [ ] Call (@2026-12-01 09:30)", Some("doing"), false, "2026-11-13").unwrap(),
+            "- [ ] Call #status/doing (@2026-12-01 09:30)"
+        );
     }
 
     #[test]

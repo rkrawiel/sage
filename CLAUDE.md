@@ -43,6 +43,7 @@ PLAN.md                 design doc + per-build-step behaviour spec + verificatio
 assets/fonts/           TTFs embedded with include_bytes! (committed); OFL licences in assets/fonts/licenses/
 assets/icons/           sage.ico (exe icon via build.rs), sage.png (window icon), sage.svg
 examples/sample-vault/  test vault: Dashboard, Tasks, Templates, Tutorial, .sage/settings.json
+assets/starter-vault/   what "Create starter vault" writes (embedded via sage_editor::starter::FILES; keep its array length in step)
 installer/sage.iss      Inno Setup 6 script → target/installer/Sage-<ver>-setup.exe
 scripts/                install.ps1 / uninstall.ps1 (per-user Windows install, HKCU only); fetch-fonts.sh (only to add or refresh a font)
 crates/                 ten crates, below
@@ -61,7 +62,7 @@ app ─→ ui ─→ { indexer, editor, query, markdown } ─→ { db, watcher, 
 | `sage-app` | `crates/app` | The `sage` binary: argument and vault resolution, Windows error box, icon (`build.rs`) | `main.rs` → `sage_ui::run_with` |
 | `sage-ui` | `crates/ui` | iced shell: state, messages, all widgets, "Sage & Paper" theme | `lib.rs` (`App`, `Message`, `Command`) |
 | `sage-indexer` | `crates/indexer` | Sync loop: notify hints + periodic mtime reconcile → SQLite. Owns the **only** write connection | `spawn`, `IndexerHandle`, `IndexEvent` |
-| `sage-editor` | `crates/editor` | Toolkit-free buffer logic: guarded save, edits, completion, find, undo, rename + link rewrite, task write-back, recurrence, templates, Quick Add, settings, merge, shortcuts | `save_guarded`, modules below |
+| `sage-editor` | `crates/editor` | Toolkit-free buffer logic: guarded save, edits, completion, find, undo, rename + link rewrite, task write-back, recurrence, templates, Quick Add, settings, merge, shortcuts, starter vault | `save_guarded`, modules below |
 | `sage-query` | `crates/query` | `view` block DSL → AST → parameterized SQL over `v_*` views; `tasks` blocks over typed documents | `parse_spec`, `run`, `dsl`, `documents` |
 | `sage-markdown` | `crates/markdown` | pulldown-cmark → preview block tree with Obsidian extras (wikilinks, embeds, callouts, highlights, properties, view blocks) | `parse`, `references`, `section`, `block` |
 | `sage-db` | `crates/db` | Index location, connections, `schema.sql`, `SCHEMA_VERSION`, FTS query building | `open_writer`, `open_reader`, `index_path_for` |
@@ -116,6 +117,7 @@ Keep platform differences inside the platform layer. These files have `cfg(windo
 - `editor/src/lib.rs`: rename retry on Windows. `editor/src/rename.rs`: case-only renames.
 - `ui/src/lib.rs`: `open_link` (`xdg-open`/`wslview`/`explorer.exe` vs `ShellExecuteW`), `reveal` in the file manager.
 - `ui/src/vault.rs`: folder picker (`rfd` on Windows).
+- `ui/src/notify.rs`: task-reminder notifications (WinRT toast via `tauri-winrt-notification` vs `notify-send`).
 - `app/src/main.rs`: `windows_subsystem = "windows"` (no console), `rfd` error box and folder picker.
 - `onedrive`, `indexer`: one placeholder test that uses sparse files is Linux-only.
 

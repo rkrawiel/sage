@@ -2,7 +2,8 @@
 //!
 //! The events are collected first, so a list item can look ahead for its
 //! checkbox: pulldown-cmark puts the marker straight into a tight item but
-//! inside the first paragraph of a loose one.
+//! inside the first paragraph of a loose one. Nesting is capped at
+//! `MAX_DEPTH`; deeper content is kept, flattened into the last level.
 
 use crate::{Align, Block, Embed, Inline, Item, Link, Property, Span, Style, Task};
 use sage_core::FmValue;
@@ -32,6 +33,7 @@ pub(crate) fn parse(src: &str) -> Vec<Block> {
         pos: 0,
         line_starts: std::iter::once(0).chain(src.match_indices('\n').map(|(i, _)| i + 1)).collect(),
         callouts: HashMap::new(),
+        depth: 0,
     };
     let properties = yaml.map(properties).unwrap_or_default();
     let mut blocks = if properties.is_empty() { Vec::new() } else { vec![Block::Properties(properties)] };
@@ -46,6 +48,20 @@ struct Walker<'a> {
     line_starts: Vec<usize>,
     /// Callouts so far by kind and title, for their keys.
     callouts: HashMap<String, usize>,
+    /// How many `blocks` calls are open, for `MAX_DEPTH`.
+    depth: usize,
+}
+
+/// How deep quotes, lists and callouts nest in the tree. Each level costs a
+/// few stack frames here and in the preview that draws it, and pulldown-cmark
+/// sets no limit, so a line of thousands of `>` would otherwise overflow the
+/// 1 MB main-thread stack on Windows.
+const MAX_DEPTH: usize = 64;
+
+/// Whether `tag` starts an element whose content is blocks, rather than one
+/// that `Walker::block` reads to its end without nesting.
+fn holds_blocks(tag: &Tag) -> bool {
+    !matches!(tag, Tag::Paragraph | Tag::Heading { .. } | Tag::CodeBlock(_) | Tag::HtmlBlock | Tag::Table(_))
 }
 
 /// What an inline run does with an image.
@@ -72,8 +88,13 @@ impl<'a> Walker<'a> {
     }
 
     /// Blocks up to the end of the enclosing element, whose `End` is consumed.
+    /// At `MAX_DEPTH` quotes, lists and other containers no longer nest: their
+    /// content joins this level, so a pathological note costs no more stack.
     fn blocks(&mut self) -> Vec<Block> {
+        self.depth += 1;
         let mut out = Vec::new();
+        // Containers flattened here, whose ends must not end this level.
+        let mut flat = 0;
         while let Some((event, range)) = self.events.get(self.pos).cloned() {
             if is_inline(&event) && !matches!(event, Event::End(_)) {
                 // A tight list item: inline content with no paragraph around it.
@@ -83,12 +104,15 @@ impl<'a> Walker<'a> {
             }
             self.pos += 1;
             match event {
+                Event::End(_) if flat > 0 => flat -= 1,
                 Event::End(_) => break,
                 Event::Rule => out.push(Block::Rule),
+                Event::Start(tag) if self.depth >= MAX_DEPTH && holds_blocks(&tag) => flat += 1,
                 Event::Start(tag) => self.block(tag, range, &mut out),
                 _ => {}
             }
         }
+        self.depth -= 1;
         out
     }
 

@@ -18,13 +18,18 @@ use sage_core::{link_key, name_key, FmValue, ParsedNote};
 use sage_watcher::Backend;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use std::collections::{HashMap, HashSet};
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender, TryRecvError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Quiet period after the last inotify event before a batch is applied. Editors
 /// and sync clients produce bursts (write temp, rename, chmod).
 const DEBOUNCE: Duration = Duration::from_millis(150);
+/// Longest a batch of events waits for quiet, counted from its first event.
+const MAX_DEBOUNCE: Duration = Duration::from_millis(1500);
+/// More distinct paths than this in one batch are handled by a full pass.
+const MAX_HINTS: usize = 500;
 /// Rows per transaction during a large reconcile, so readers see steady progress.
 const BATCH: usize = 200;
 /// A file modified this recently could change again within the same timestamp
@@ -125,45 +130,91 @@ pub fn spawn(
             }
 
             let mut pending = Some(Msg::Rescan); // reconcile once at startup
+            // When the last full pass ran. The safety-net pass is timed from it,
+            // not from the last message, or a busy vault would never get one.
+            let mut last_full = Instant::now();
             loop {
+                let wait = backend.rescan_interval().saturating_sub(last_full.elapsed());
                 let msg = match pending.take() {
                     Some(msg) => Ok(msg),
-                    None => rx.recv_timeout(backend.rescan_interval()),
+                    // Due already: a steady stream of events must not keep postponing it.
+                    None if wait.is_zero() => Err(RecvTimeoutError::Timeout),
+                    None => rx.recv_timeout(wait),
                 };
                 // Sync requests answered by the pass this iteration runs.
                 let mut synced = Vec::new();
-                let result = match msg {
-                    Ok(Msg::Fs(mut paths)) => {
-                        let mut rescan = false;
+                let mut full = false;
+                let mut paths = HashSet::new();
+                match msg {
+                    Ok(Msg::Fs(first)) => {
+                        paths.extend(first);
+                        // A process writing several times a second would otherwise
+                        // restart the quiet period forever and never be applied.
+                        let deadline = Instant::now() + MAX_DEBOUNCE;
                         loop {
-                            match rx.recv_timeout(DEBOUNCE) {
+                            let wait = DEBOUNCE.min(deadline.saturating_duration_since(Instant::now()));
+                            if wait.is_zero() {
+                                break;
+                            }
+                            match rx.recv_timeout(wait) {
                                 Ok(Msg::Fs(more)) => paths.extend(more),
-                                Ok(Msg::Rescan) => rescan = true,
+                                Ok(Msg::Rescan) => full = true,
                                 Ok(Msg::Sync(id)) => {
-                                    rescan = true;
+                                    full = true;
                                     synced.push(id);
                                 }
                                 Ok(Msg::Shutdown) | Err(RecvTimeoutError::Disconnected) => return,
                                 Err(RecvTimeoutError::Timeout) => break,
                             }
                         }
-                        if rescan {
-                            indexer.reconcile(&mut on_event)
-                        } else {
-                            indexer.apply_hints(paths, &mut on_event)
-                        }
                     }
                     Ok(Msg::Sync(id)) => {
                         synced.push(id);
-                        indexer.reconcile(&mut on_event)
+                        full = true;
                     }
-                    Ok(Msg::Rescan) | Err(RecvTimeoutError::Timeout) => {
-                        indexer.reconcile(&mut on_event)
-                    }
+                    Ok(Msg::Rescan) | Err(RecvTimeoutError::Timeout) => full = true,
                     Ok(Msg::Shutdown) | Err(RecvTimeoutError::Disconnected) => return,
-                };
-                if let Err(e) = result {
-                    on_event(IndexEvent::Error(format!("{e:#}")));
+                }
+                // So many paths at once (a checkout, a sync client catching up)
+                // are cheaper to find with one walk than one by one.
+                full |= paths.len() > MAX_HINTS;
+                if full {
+                    // Everything queued meanwhile is answered by the one pass about
+                    // to start, rather than by a full pass each.
+                    loop {
+                        match rx.try_recv() {
+                            Ok(Msg::Fs(_) | Msg::Rescan) => {}
+                            Ok(Msg::Sync(id)) => synced.push(id),
+                            Ok(Msg::Shutdown) | Err(TryRecvError::Disconnected) => return,
+                            Err(TryRecvError::Empty) => break,
+                        }
+                    }
+                }
+                // A bug must not stop the index for the rest of the session with
+                // nothing said: it is reported, and the next message tries again.
+                let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    if full {
+                        indexer.reconcile(&mut on_event)
+                    } else {
+                        indexer.apply_hints(paths.into_iter().collect(), &mut on_event)
+                    }
+                }));
+                if full {
+                    last_full = Instant::now();
+                }
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => on_event(IndexEvent::Error(format!("{e:#}"))),
+                    Err(panic) => {
+                        let what = panic
+                            .downcast_ref::<&str>()
+                            .map(|s| s.to_string())
+                            .or_else(|| panic.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "unknown cause".into());
+                        on_event(IndexEvent::Error(format!("the indexer failed: {what}")));
+                        // The open transaction rolled back as it unwound.
+                        indexer.reload_known();
+                    }
                 }
                 // Even after an error: whoever waits must not wait forever.
                 for id in synced {
@@ -206,6 +257,8 @@ pub struct Indexer {
 impl Indexer {
     pub fn open(vault: PathBuf, db_path: &Path) -> Result<Self> {
         let conn = sage_db::open_writer(db_path)?;
+        // Every statement run per note is cached; rusqlite keeps only 16.
+        conn.set_prepared_statement_cache_capacity(64);
         let known = load_known(&conn)?;
         let onedrive = sage_onedrive::root(&vault).is_some();
         Ok(Self { vault, conn, known, onedrive })
@@ -213,6 +266,24 @@ impl Indexer {
 
     fn is_placeholder(&self, meta: &std::fs::Metadata) -> bool {
         self.onedrive && sage_onedrive::is_placeholder(meta)
+    }
+
+    /// Whether a file stats as the index last stored it. A racy note was stored
+    /// with mtime 0, so it never matches and is read again.
+    fn unchanged(&self, rel: &str, mtime_ns: i64, size: i64, placeholder: bool) -> bool {
+        // Freeing up space or downloading a note changes its blocks, not its
+        // stamp; the stat is there anyway, so a note's cloud state is compared too.
+        self.known
+            .get(rel)
+            .is_some_and(|k| k.mtime_ns == mtime_ns && k.size == size && k.cloud == (placeholder && is_note(rel)))
+    }
+
+    /// Reads `known` again from what the index really holds, after a write that
+    /// rolled back: `known` is updated as rows are written, before the commit.
+    fn reload_known(&mut self) {
+        if let Ok(known) = load_known(&self.conn) {
+            self.known = known;
+        }
     }
 
     /// Full pass: makes the index match the disk. Cheap when little has changed.
@@ -281,13 +352,7 @@ impl Indexer {
             };
             let (mtime_ns, size) = stamp_of(&meta);
             let placeholder = self.is_placeholder(&meta);
-            // Freeing up space or downloading a note changes its blocks, not
-            // its stamp; the stat is there anyway, so a note's cloud state is
-            // compared too.
-            let unchanged = self.known.get(&rel).is_some_and(|k| {
-                k.mtime_ns == mtime_ns && k.size == size && k.cloud == (placeholder && is_note(&rel))
-            });
-            if !unchanged {
+            if !self.unchanged(&rel, mtime_ns, size, placeholder) {
                 dirty.push(Seen { rel: rel.clone(), abs: entry.into_path(), mtime_ns, size, placeholder });
             }
             on_disk.insert(rel);
@@ -316,7 +381,11 @@ impl Indexer {
                 Ok(meta) if meta.is_file() => {
                     let (mtime_ns, size) = stamp_of(&meta);
                     let placeholder = self.is_placeholder(&meta);
-                    dirty.push(Seen { rel, abs, mtime_ns, size, placeholder });
+                    // An event for a file as indexed (a folder's, a chmod, our own
+                    // save seen twice) costs a stat, not a read and a hash.
+                    if !self.unchanged(&rel, mtime_ns, size, placeholder) {
+                        dirty.push(Seen { rel, abs, mtime_ns, size, placeholder });
+                    }
                 }
                 // A folder's own events, such as its time changing whenever a
                 // note in it is saved on Windows, say nothing its notes' events
@@ -367,12 +436,9 @@ impl Indexer {
     ) -> Result<Vec<String>> {
         let result = self.write(dirty, missing, on_event);
         if result.is_err() {
-            // `known` is updated as rows are written, before the commit. A failed
-            // batch rolled back, so read it again from what the index really holds,
-            // or those notes would look indexed until they change again.
-            if let Ok(known) = load_known(&self.conn) {
-                self.known = known;
-            }
+            // A failed batch rolled back; without this, its notes would look
+            // indexed until they change again.
+            self.reload_known();
         }
         result
     }
@@ -380,7 +446,7 @@ impl Indexer {
     fn write(
         &mut self,
         dirty: Vec<Seen>,
-        mut missing: Vec<String>,
+        missing: Vec<String>,
         on_event: &mut impl FnMut(IndexEvent),
     ) -> Result<Vec<String>> {
         if dirty.is_empty() && missing.is_empty() {
@@ -391,13 +457,16 @@ impl Indexer {
         let mut changed = Vec::new();
         // Names whose link resolution may change: new, renamed or removed files.
         let mut relink: HashSet<String> = HashSet::new();
+        // Missing paths found again under a new name, which must not be deleted.
+        let mut renamed: HashSet<String> = HashSet::new();
 
         // Content hash of every missing note, to recognise renames.
         let mut gone_by_hash: HashMap<Vec<u8>, String> = HashMap::new();
         for path in &missing {
             let hash: Option<Vec<u8>> = self
                 .conn
-                .query_row("SELECT hash FROM files WHERE path = ?1", [path], |r| r.get(0))
+                .prepare_cached("SELECT hash FROM files WHERE path = ?1")?
+                .query_row([path], |r| r.get(0))
                 .optional()?
                 .flatten();
             if let Some(hash) = hash {
@@ -418,7 +487,7 @@ impl Indexer {
 
                 if !is_note(&seen.rel) {
                     // Attachment: tracked for ![[embeds]], never read.
-                    let id = upsert_file(&tx, &seen.rel, None, None, mtime_ns, seen.size, false)?;
+                    let (id, _) = upsert_file(&tx, &seen.rel, None, None, mtime_ns, seen.size, false)?;
                     self.known.insert(seen.rel.clone(), Stamp { id, mtime_ns, size: seen.size, cloud: false });
                     if prev.is_none() {
                         relink.insert(name_key(&seen.rel));
@@ -435,17 +504,15 @@ impl Indexer {
                     let stamp = |id| Stamp { id, mtime_ns: 0, size: seen.size, cloud: true };
                     match prev {
                         Some(prev) => {
-                            tx.execute(
-                                "UPDATE files SET mtime_ns = 0, size = ?1, cloud = 1 WHERE id = ?2",
-                                params![seen.size, prev.id],
-                            )?;
+                            tx.prepare_cached("UPDATE files SET mtime_ns = 0, size = ?1, cloud = 1 WHERE id = ?2")?
+                                .execute(params![seen.size, prev.id])?;
                             self.known.insert(seen.rel.clone(), stamp(prev.id));
                             if !prev.cloud {
                                 changed.push(seen.rel.clone());
                             }
                         }
                         None => {
-                            let id = upsert_file(&tx, &seen.rel, None, None, 0, seen.size, true)?;
+                            let (id, _) = upsert_file(&tx, &seen.rel, None, None, 0, seen.size, true)?;
                             self.known.insert(seen.rel.clone(), stamp(id));
                             relink.insert(name_key(&seen.rel));
                             changed.push(seen.rel.clone());
@@ -455,8 +522,8 @@ impl Indexer {
                 }
 
                 if seen.size > MAX_NOTE_BYTES {
-                    let id = upsert_file(&tx, &seen.rel, None, None, mtime_ns, seen.size, false)?;
-                    write_note(&tx, id, &seen.rel, &ParsedNote::default(), "")?;
+                    let (id, title) = upsert_file(&tx, &seen.rel, None, None, mtime_ns, seen.size, false)?;
+                    write_note(&tx, id, &seen.rel, &title, &ParsedNote::default(), "")?;
                     self.known.insert(seen.rel.clone(), Stamp { id, mtime_ns, size: seen.size, cloud: false });
                     if prev.is_none() {
                         relink.insert(name_key(&seen.rel));
@@ -484,15 +551,14 @@ impl Indexer {
 
                 if let Some(prev) = prev {
                     let stored: Option<Vec<u8>> = tx
-                        .query_row("SELECT hash FROM files WHERE id = ?1", [prev.id], |r| r.get(0))
+                        .prepare_cached("SELECT hash FROM files WHERE id = ?1")?
+                        .query_row([prev.id], |r| r.get(0))
                         .optional()?
                         .flatten();
                     if stored.as_deref() == Some(hash) {
                         // Touched, or downloaded, but identical: refresh the stamp only.
-                        tx.execute(
-                            "UPDATE files SET mtime_ns = ?1, size = ?2, cloud = 0 WHERE id = ?3",
-                            params![mtime_ns, seen.size, prev.id],
-                        )?;
+                        tx.prepare_cached("UPDATE files SET mtime_ns = ?1, size = ?2, cloud = 0 WHERE id = ?3")?
+                            .execute(params![mtime_ns, seen.size, prev.id])?;
                         self.known
                             .insert(seen.rel.clone(), Stamp { id: prev.id, mtime_ns, size: seen.size, cloud: false });
                         if prev.cloud {
@@ -504,10 +570,13 @@ impl Indexer {
                     // Same bytes under a new path: a rename. Move the row so the
                     // id, and with it every backlink, survives.
                     let old = self.known.remove(&old_path).expect("missing paths are known");
+                    // A note titled by its file name takes the new name; reading
+                    // the title from the text keeps one set in it.
+                    let title = title_of(&seen.rel, Some(&sage_core::parse(&String::from_utf8_lossy(&bytes))));
                     tx.execute(
                         "UPDATE files SET path = ?1, link_key = ?2, name_key = ?3, parent = ?4,
-                                          mtime_ns = ?5, size = ?6, cloud = 0
-                         WHERE id = ?7",
+                                          mtime_ns = ?5, size = ?6, cloud = 0, title = ?7
+                         WHERE id = ?8",
                         params![
                             seen.rel,
                             link_key(&seen.rel),
@@ -515,12 +584,13 @@ impl Indexer {
                             parent_of(&seen.rel),
                             mtime_ns,
                             seen.size,
+                            title,
                             old.id
                         ],
                     )?;
                     tx.execute(
-                        "UPDATE fts SET path = ?1 WHERE rowid = ?2",
-                        params![seen.rel, old.id],
+                        "UPDATE fts SET path = ?1, title = ?2 WHERE rowid = ?3",
+                        params![seen.rel, title, old.id],
                     )?;
                     // Its relative links now start from another folder.
                     let relative: Vec<(i64, String)> = tx
@@ -539,8 +609,8 @@ impl Indexer {
                     }
                     self.known
                         .insert(seen.rel.clone(), Stamp { id: old.id, mtime_ns, size: seen.size, cloud: false });
-                    missing.retain(|p| p != &old_path);
                     relink.insert(name_key(&old_path));
+                    renamed.insert(old_path.clone());
                     relink.insert(name_key(&seen.rel));
                     changed.push(old_path);
                     changed.push(seen.rel.clone());
@@ -553,12 +623,12 @@ impl Indexer {
                 // may now find another note or none.
                 if let Some(prev) = prev {
                     let old: Option<String> =
-                        tx.query_row("SELECT id_key FROM files WHERE id = ?1", [prev.id], |r| r.get(0))?;
+                        tx.prepare_cached("SELECT id_key FROM files WHERE id = ?1")?.query_row([prev.id], |r| r.get(0))?;
                     relink.extend(old);
                 }
                 relink.extend(note.id.as_deref().map(link_key));
-                let id = upsert_file(&tx, &seen.rel, Some(&note), Some(hash), mtime_ns, seen.size, false)?;
-                write_note(&tx, id, &seen.rel, &note, &text)?;
+                let (id, title) = upsert_file(&tx, &seen.rel, Some(&note), Some(hash), mtime_ns, seen.size, false)?;
+                write_note(&tx, id, &seen.rel, &title, &note, &text)?;
                 self.known.insert(seen.rel.clone(), Stamp { id, mtime_ns, size: seen.size, cloud: false });
                 if prev.is_none() {
                     relink.insert(name_key(&seen.rel));
@@ -572,11 +642,11 @@ impl Indexer {
         }
 
         let tx = self.conn.transaction()?;
-        for path in &missing {
+        for path in missing.iter().filter(|path| !renamed.contains(*path)) {
             if let Some(stamp) = self.known.remove(path) {
                 // Child rows cascade; links pointing here fall back to unresolved.
-                tx.execute("DELETE FROM fts WHERE rowid = ?1", [stamp.id])?;
-                tx.execute("DELETE FROM files WHERE id = ?1", [stamp.id])?;
+                tx.prepare_cached("DELETE FROM fts WHERE rowid = ?1")?.execute([stamp.id])?;
+                tx.prepare_cached("DELETE FROM files WHERE id = ?1")?.execute([stamp.id])?;
                 relink.insert(name_key(path));
                 changed.push(path.clone());
             }
@@ -584,10 +654,18 @@ impl Indexer {
         // A new or renamed file can become the better match for existing links,
         // so reopen the ones that mention its name, then resolve everything open.
         for name in &relink {
-            tx.execute("UPDATE links SET dst_file_id = NULL WHERE target_name = ?1", [name])?;
+            tx.prepare_cached("UPDATE links SET dst_file_id = NULL WHERE target_name = ?1 AND dst_file_id IS NOT NULL")?
+                .execute([name])?;
         }
         resolve_links(&tx)?;
         tx.commit()?;
+
+        // A large pass grows the write-ahead log by its whole size; give the
+        // space back now rather than keep it until the app closes. A reader
+        // still using the log can make it give up, which is fine.
+        if total > BATCH {
+            let _ = self.conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+        }
 
         Ok(changed)
     }
@@ -609,8 +687,11 @@ impl Indexer {
 /// A bare `[[name]]` that no file name matches then finds the note whose
 /// frontmatter `id` it is, so `[[fix-voice-reconnect]]` reaches a task document
 /// whatever its file is called.
+///
+/// Only links that some file could match are written: SQLite rewrites a row
+/// set to the NULL it already holds, and a vault keeps many dangling links.
 fn resolve_links(tx: &Transaction) -> Result<()> {
-    tx.execute_batch(
+    tx.prepare_cached(
         "UPDATE links SET dst_file_id = (
              SELECT f.id FROM files f
              WHERE f.name_key = links.target_name
@@ -619,17 +700,30 @@ fn resolve_links(tx: &Transaction) -> Result<()> {
                     OR substr(f.link_key, -length(links.target_key) - 1) = '/' || links.target_key)
              ORDER BY length(f.path), f.path
              LIMIT 1)
-         WHERE dst_file_id IS NULL AND target_name <> '';
-         UPDATE links SET dst_file_id = (
+         WHERE dst_file_id IS NULL AND target_name <> ''
+           AND EXISTS (SELECT 1 FROM files f WHERE f.name_key = links.target_name)",
+    )?
+    .execute([])?;
+    tx.prepare_cached(
+        "UPDATE links SET dst_file_id = (
              SELECT f.id FROM files f
              WHERE f.id_key = links.target_key
              ORDER BY length(f.path), f.path
              LIMIT 1)
-         WHERE dst_file_id IS NULL AND target_key = target_name AND target_name <> '';",
-    )?;
+         WHERE dst_file_id IS NULL AND target_key = target_name AND target_name <> ''
+           AND EXISTS (SELECT 1 FROM files f WHERE f.id_key = links.target_key)",
+    )?
+    .execute([])?;
     Ok(())
 }
 
+/// A file's title: the note's frontmatter title or first H1, else its file name.
+fn title_of(rel: &str, note: Option<&ParsedNote>) -> String {
+    let file_name = rel.rsplit('/').next().unwrap_or(rel);
+    note.and_then(|n| n.title.clone()).unwrap_or_else(|| file_name.strip_suffix(".md").unwrap_or(file_name).to_owned())
+}
+
+/// Writes a file's row and returns its id and the title stored.
 fn upsert_file(
     tx: &Transaction,
     rel: &str,
@@ -638,11 +732,8 @@ fn upsert_file(
     mtime_ns: i64,
     size: i64,
     cloud: bool,
-) -> Result<i64> {
-    let file_name = rel.rsplit('/').next().unwrap_or(rel);
-    let title = note
-        .and_then(|n| n.title.clone())
-        .unwrap_or_else(|| file_name.strip_suffix(".md").unwrap_or(file_name).to_owned());
+) -> Result<(i64, String)> {
+    let title = title_of(rel, note);
     let id_key = note.and_then(|n| n.id.as_deref()).map(link_key);
     // A document's status as a Kanban column names it, with `_` read as `-` as
     // `TaskStatus::parse` reads it. In Rust, so it folds case beyond ASCII.
@@ -653,28 +744,32 @@ fn upsert_file(
             _ => None,
         })
         .filter(|slug| !slug.is_empty());
-    let id = tx.query_row(
-        "INSERT INTO files (path, link_key, name_key, parent, ext, title, mtime_ns, size, hash, indexed_at, cloud, id_key, status_key)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, unixepoch(), ?10, ?11, ?12)
-         ON CONFLICT (path) DO UPDATE SET
-             title = excluded.title, mtime_ns = excluded.mtime_ns, size = excluded.size,
-             hash = excluded.hash, indexed_at = excluded.indexed_at, cloud = excluded.cloud,
-             id_key = excluded.id_key, status_key = excluded.status_key
-         RETURNING id",
-        params![rel, link_key(rel), name_key(rel), parent_of(rel), ext_of(rel), title, mtime_ns, size, hash, cloud, id_key, status_key],
-        |r| r.get(0),
-    )?;
-    Ok(id)
+    let id = tx
+        .prepare_cached(
+            "INSERT INTO files (path, link_key, name_key, parent, ext, title, mtime_ns, size, hash, indexed_at, cloud, id_key, status_key)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, unixepoch(), ?10, ?11, ?12)
+             ON CONFLICT (path) DO UPDATE SET
+                 title = excluded.title, mtime_ns = excluded.mtime_ns, size = excluded.size,
+                 hash = excluded.hash, indexed_at = excluded.indexed_at, cloud = excluded.cloud,
+                 id_key = excluded.id_key, status_key = excluded.status_key
+             RETURNING id",
+        )?
+        .query_row(
+            params![rel, link_key(rel), name_key(rel), parent_of(rel), ext_of(rel), title, mtime_ns, size, hash, cloud, id_key, status_key],
+            |r| r.get(0),
+        )?;
+    Ok((id, title))
 }
 
 /// Replaces every derived row for one note, and the text they come from.
-fn write_note(tx: &Transaction, id: i64, rel: &str, note: &ParsedNote, text: &str) -> Result<()> {
-    tx.execute("INSERT OR REPLACE INTO texts (file_id, text) VALUES (?1, ?2)", params![id, text])?;
+/// `title` is the one [`upsert_file`] stored, which `fts` repeats.
+fn write_note(tx: &Transaction, id: i64, rel: &str, title: &str, note: &ParsedNote, text: &str) -> Result<()> {
+    tx.prepare_cached("INSERT OR REPLACE INTO texts (file_id, text) VALUES (?1, ?2)")?.execute(params![id, text])?;
     for table in ["frontmatter", "aliases", "headings", "tags", "tasks"] {
-        tx.execute(&format!("DELETE FROM {table} WHERE file_id = ?1"), [id])?;
+        tx.prepare_cached(&format!("DELETE FROM {table} WHERE file_id = ?1"))?.execute([id])?;
     }
-    tx.execute("DELETE FROM links WHERE src_file_id = ?1", [id])?;
-    tx.execute("DELETE FROM fts WHERE rowid = ?1", [id])?;
+    tx.prepare_cached("DELETE FROM links WHERE src_file_id = ?1")?.execute([id])?;
+    tx.prepare_cached("DELETE FROM fts WHERE rowid = ?1")?.execute([id])?;
 
     let mut stmt = tx.prepare_cached(
         "INSERT OR REPLACE INTO frontmatter (file_id, key, ord, value_type, value, value_num)
@@ -725,23 +820,19 @@ fn write_note(tx: &Transaction, id: i64, rel: &str, note: &ParsedNote, text: &st
 
     let mut stmt = tx.prepare_cached(
         "INSERT INTO tasks (file_id, line, indent, state, text, raw, status,
-                            due, scheduled, start, done_on, priority)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                            due, scheduled, start, done_on, priority, reminder)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
     )?;
     for t in &note.tasks {
         stmt.execute(params![
             id, t.line, t.indent, t.state.to_string(), t.text, t.raw, t.status,
-            t.due, t.scheduled, t.start, t.done, t.priority
+            t.due, t.scheduled, t.start, t.done, t.priority, t.reminder
         ])?;
     }
 
     let tags = note.tags.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(" ");
-    let title: String =
-        tx.query_row("SELECT title FROM files WHERE id = ?1", [id], |r| r.get(0))?;
-    tx.execute(
-        "INSERT INTO fts (rowid, title, body, tags, path) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![id, title, note.body, tags, rel],
-    )?;
+    tx.prepare_cached("INSERT INTO fts (rowid, title, body, tags, path) VALUES (?1, ?2, ?3, ?4, ?5)")?
+        .execute(params![id, title, note.body, tags, rel])?;
     Ok(())
 }
 
@@ -821,6 +912,31 @@ mod tests {
         ix.reconcile(&mut |_| {}).unwrap();
         assert_eq!(count(&ix, "SELECT count(*) FROM v_tasks"), 5);
         assert_eq!(count(&ix, "SELECT count(*) FROM v_tasks WHERE tracked"), 3);
+    }
+
+    #[test]
+    fn reminders_of_checkboxes_and_task_documents_are_indexed() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).unwrap();
+        fs::write(vault.join("A.md"), "- [ ] call (@2026-12-01 09:30)
+- [ ] pay (@2026-12-02)
+- [ ] plain
+").unwrap();
+        fs::write(vault.join("T.md"), "---
+type: task
+status: todo
+reminder: 2026-12-03 08:00
+---
+").unwrap();
+        age(&vault.join("A.md"));
+        age(&vault.join("T.md"));
+        let mut ix = Indexer::open(vault.canonicalize().unwrap(), &dir.path().join("index.db")).unwrap();
+        ix.reconcile(&mut |_| {}).unwrap();
+        assert_eq!(count(&ix, "SELECT count(*) FROM v_tasks WHERE reminder = '2026-12-01 09:30' AND tracked"), 1);
+        assert_eq!(count(&ix, "SELECT count(*) FROM v_tasks WHERE reminder = '2026-12-02' AND tracked"), 1);
+        assert_eq!(count(&ix, "SELECT count(*) FROM v_tasks WHERE reminder IS NULL AND NOT tracked"), 1);
+        assert_eq!(count(&ix, "SELECT count(*) FROM v_documents WHERE reminder = '2026-12-03 08:00'"), 1);
     }
 
     #[test]
@@ -1089,7 +1205,83 @@ mod tests {
             }
         }
         assert_eq!(count("later"), 1);
+
+        // Requests queued together share a pass, and every one is answered.
+        for id in [8, 9, 10] {
+            handle.sync(id);
+        }
+        let mut answered = Vec::new();
+        while answered.len() < 3 {
+            match rx.recv_timeout(Duration::from_secs(10)).expect("a sync went unanswered") {
+                IndexEvent::Synced(id) => answered.push(id),
+                IndexEvent::Error(e) => panic!("{e}"),
+                _ => {}
+            }
+        }
+        assert_eq!(answered, [8, 9, 10]);
         drop(handle);
+    }
+
+    #[test]
+    fn a_renamed_note_titled_by_its_name_takes_the_new_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).unwrap();
+        fs::write(vault.join("Draft.md"), "no heading here\n").unwrap();
+        fs::write(vault.join("Headed.md"), "# Kept title\n").unwrap();
+        for f in ["Draft.md", "Headed.md"] {
+            age(&vault.join(f));
+        }
+        let mut ix = Indexer::open(vault.canonicalize().unwrap(), &dir.path().join("index.db")).unwrap();
+        ix.reconcile(&mut |_| {}).unwrap();
+        let draft_id = ix.known["Draft.md"].id;
+
+        fs::rename(vault.join("Draft.md"), vault.join("Final.md")).unwrap();
+        fs::rename(vault.join("Headed.md"), vault.join("Moved.md")).unwrap();
+        ix.reconcile(&mut |_| {}).unwrap();
+        assert_eq!(ix.known["Final.md"].id, draft_id, "recognised as a rename");
+        let title = |path: &str| -> String {
+            ix.conn.query_row("SELECT title FROM files WHERE path = ?1", [path], |r| r.get(0)).unwrap()
+        };
+        assert_eq!((title("Final.md"), title("Moved.md")), ("Final".into(), "Kept title".into()));
+        assert_eq!(count(&ix, "SELECT count(*) FROM fts WHERE fts MATCH 'title:final'"), 1);
+        assert_eq!(count(&ix, "SELECT count(*) FROM fts WHERE fts MATCH 'title:draft'"), 0);
+    }
+
+    #[test]
+    fn writes_leave_dangling_links_and_unchanged_hinted_files_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        fs::create_dir_all(&vault).unwrap();
+        fs::write(vault.join("Home.md"), "[[Missing]] and [[Other]]\n").unwrap();
+        age(&vault.join("Home.md"));
+        let vault = vault.canonicalize().unwrap();
+        let mut ix = Indexer::open(vault.clone(), &dir.path().join("index.db")).unwrap();
+        ix.reconcile(&mut |_| {}).unwrap();
+        ix.conn
+            .execute_batch(
+                "CREATE TEMP TABLE hits (what TEXT);
+                 CREATE TEMP TRIGGER link_hit AFTER UPDATE ON links BEGIN INSERT INTO hits VALUES (OLD.target); END;
+                 CREATE TEMP TRIGGER file_hit AFTER UPDATE ON files BEGIN INSERT INTO hits VALUES (OLD.path); END;",
+            )
+            .unwrap();
+        let hits = |ix: &Indexer| -> Vec<String> {
+            let mut stmt = ix.conn.prepare("SELECT what FROM hits ORDER BY 1").unwrap();
+            stmt.query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect()
+        };
+
+        // A new note resolves the link to it and touches no other link row.
+        fs::write(vault.join("Other.md"), "x").unwrap();
+        age(&vault.join("Other.md"));
+        ix.reconcile(&mut |_| {}).unwrap();
+        assert_eq!(hits(&ix), ["Other"]);
+        assert_eq!(count(&ix, "SELECT count(*) FROM links WHERE target = 'Missing' AND dst_file_id IS NULL"), 1);
+
+        // A hint for a file the index already holds as it is reads nothing.
+        let mut events = Vec::new();
+        ix.apply_hints(vec![vault.join("Home.md")], &mut |e| events.push(e)).unwrap();
+        assert_eq!(hits(&ix), ["Other"]);
+        assert!(events.is_empty(), "{events:?}");
     }
 
     #[test]

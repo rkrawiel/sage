@@ -139,7 +139,7 @@ fn error<T>(message: impl Into<String>, at: usize) -> Result<T, Error> {
 /// Parses a query. An empty query matches everything.
 pub fn parse(query: &str) -> Result<Expr, Error> {
     let tokens = lex(query)?;
-    let mut parser = Parser { tokens, pos: 0, end: query.chars().count() };
+    let mut parser = Parser { tokens, pos: 0, end: query.chars().count(), depth: 0 };
     let expr = parser.or()?;
     match parser.tokens.get(parser.pos) {
         Some((Tok::Close, at)) => error("`)` without a matching `(`", *at),
@@ -236,10 +236,17 @@ fn lex(query: &str) -> Result<Vec<(Tok, usize)>, Error> {
     Ok(tokens)
 }
 
+/// How deep `(` and `-` may nest. The parser and the SQL compiler recurse once
+/// per level, and a query of thousands of `(` would otherwise overflow the
+/// 1 MB main-thread stack on Windows.
+const MAX_DEPTH: usize = 64;
+
 struct Parser {
     tokens: Vec<(Tok, usize)>,
     pos: usize,
     end: usize,
+    /// Groups and negations open around the current token.
+    depth: usize,
 }
 
 impl Parser {
@@ -280,9 +287,17 @@ impl Parser {
         };
         self.pos += 1;
         match tok {
-            Tok::Not => Ok(Expr::Not(Box::new(self.unary()?))),
+            Tok::Not | Tok::Open if self.depth >= MAX_DEPTH => error("groups and negations nest too deeply", at),
+            Tok::Not => {
+                self.depth += 1;
+                let inner = self.unary()?;
+                self.depth -= 1;
+                Ok(Expr::Not(Box::new(inner)))
+            }
             Tok::Open => {
+                self.depth += 1;
                 let inner = self.or()?;
+                self.depth -= 1;
                 if self.peek() != Some(&Tok::Close) {
                     return error("`(` without a matching `)`", at);
                 }
@@ -544,5 +559,15 @@ mod tests {
         assert!(parse("file<x").unwrap_err().message.contains("takes `:`"));
         assert_eq!(at("kind:note"), 5);
         assert!(parse("kind:note").unwrap_err().message.contains("use document or checkbox"));
+    }
+
+    #[test]
+    fn very_deep_nesting_is_an_error_not_a_stack_overflow() {
+        for query in [format!("{}a{}", "(".repeat(10_000), ")".repeat(10_000)), format!("{}a", "-".repeat(10_000))] {
+            let err = parse(&query).unwrap_err();
+            assert_eq!((err.message.as_str(), err.at), ("groups and negations nest too deeply", 64));
+        }
+        let ok = format!("{}a{}", "(".repeat(64), ")".repeat(64));
+        assert_eq!(parse(&ok).unwrap(), text("a"));
     }
 }

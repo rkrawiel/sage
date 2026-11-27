@@ -10,7 +10,8 @@
 //! Lines compare without their line endings, so a difference in endings alone
 //! is not a change, but every string a merge returns keeps the endings it had.
 
-use similar::{capture_diff_slices, Algorithm, DiffOp};
+use similar::{capture_diff_slices_deadline, Algorithm, DiffOp};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Merge {
@@ -272,8 +273,12 @@ fn hunks(old: &[&str], new: &[&str], side: Side) -> Vec<Hunk> {
     // Patience anchors on lines that occur once on each side, such as headings
     // and sentences. Notes repeat blank lines and list markers a lot, and
     // Myers happily aligns those, which splits one edit into scattered pieces.
+    // Merges run on the UI thread, so a long rewritten note must not stall it:
+    // past the deadline the diff gives up searching and returns coarser, but
+    // still correct, hunks.
+    let deadline = Instant::now() + Duration::from_millis(200);
     let mut out: Vec<Hunk> = Vec::new();
-    for op in capture_diff_slices(Algorithm::Patience, &old_keys, &new_keys) {
+    for op in capture_diff_slices_deadline(Algorithm::Patience, &old_keys, &new_keys, Some(deadline)) {
         let (b0, b1, s0, s1) = match op {
             DiffOp::Equal { .. } => continue,
             DiffOp::Delete { old_index, old_len, new_index } => (old_index, old_index + old_len, new_index, new_index),
@@ -354,6 +359,19 @@ mod tests {
         let merge = merge3(base, ours, theirs);
         assert_eq!(merge.conflicts(), 0, "{merge:?}");
         merge.resolve(&[])
+    }
+
+    #[test]
+    fn a_long_note_rewritten_on_disk_merges_correctly_within_the_deadline() {
+        // Few distinct lines leave patience nothing to anchor on, so without
+        // a deadline the fallback diff would take many seconds here.
+        let base: String = (0..20_000).map(|i| format!("{}\n", i % 7)).collect();
+        let theirs: String = (0..20_000).map(|i| format!("{}\n", i % 11)).collect();
+        let started = std::time::Instant::now();
+        assert_eq!(clean(&base, &base, &theirs), theirs);
+        let two_way = diff2(&base, &theirs);
+        assert_eq!(two_way.resolve(&vec![Choice::Theirs; two_way.conflicts()]), theirs);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
     }
 
     #[test]

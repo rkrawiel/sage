@@ -33,6 +33,7 @@ Sage reads the Tasks plugin's emoji format:
 | `✅ date` | done on |
 | `🔺 ⏫ 🔼 🔽 ⏬` | priority: highest, high, medium, low, lowest |
 | `🔁 every …` | recurrence |
+| `(@date)`, `(@date HH:MM)` | reminder, in the Reminder plugin's format: see Reminders below |
 
 Dataview's inline fields, such as `[due:: 2026-11-30]`, are read as well; when Sage writes a date, it writes the emoji form. Dates are `YYYY-MM-DD`.
 
@@ -40,7 +41,13 @@ Task lines inside quotes and callouts (`> - [ ] …`) are tasks too.
 
 ## New task line: `Ctrl+Shift+T`
 
-A small form asks for a title and a due date: `YYYY-MM-DD`, `today`, `tomorrow`, or nothing. `Tab` moves between the fields, `Enter` writes the task, `Esc` cancels. The line, like `- [ ] Title 📅 2026-11-30`, goes on the cursor's line when it is blank, else on a new line below it, indented like it when it is a list item. It never goes into the frontmatter.
+A small form asks for a title, a due date (`YYYY-MM-DD`, `today`, `tomorrow`, or nothing) and when to remind you (`9:30` on the due date or else today, `tomorrow 9:30`, `YYYY-MM-DD HH:MM`, or nothing). `Tab` moves between the fields, `Enter` writes the task, `Esc` cancels. The line, like `- [ ] Title 📅 2026-11-30 (@2026-11-30 09:30)`, goes on the cursor's line when it is blank, else on a new line below it, indented like it when it is a list item. It never goes into the frontmatter.
+
+## Reminders
+
+A task with `(@2026-11-30 09:30)` on its line reminds you then: Sage shows a system notification and a note at the bottom right with **Open**, which goes to the task. `(@2026-11-30)` without a time reminds at the default time, 09:00 unless [[Settings]] say otherwise. This is the Obsidian Reminder plugin's format, so the plugin reads the same lines. A [[Typed documents|task document]] reminds with a `reminder: 2026-11-30 09:30` property.
+
+Only open tasks remind: checking or cancelling one stops it. Sage reminds while it is running; reminders that went off while it was closed are gathered into one notification at the next start. Settings > Tasks can turn the system notifications off, and sets the default time.
 
 ## Checking a task
 
@@ -56,7 +63,7 @@ Run **Show tasks** from the [[Command palette]] for every open task in the vault
 
 ## Recurring tasks
 
-Checking a task with `🔁 every …` (or `[repeat:: every …]`) inserts the next occurrence above it. Its dates move forward by the same number of days as its due date moves to the next date; with `when done`, from today instead.
+Checking a task with `🔁 every …` (or `[repeat:: every …]`) inserts the next occurrence above it. Its dates, a reminder's included, move forward by the same number of days as its due date moves to the next date; with `when done`, from today instead.
 
 Rules Sage understands:
 

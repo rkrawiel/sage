@@ -85,7 +85,7 @@ impl Highlighter for Markdown {
             // Only the same mark, at least as long, closes it, so a fence shown
             // inside a longer one stays code.
             Block::Fence(open) => (whole(t.text_2), if fence_closes(line, open) { Block::Body } else { Block::Fence(open) }),
-            Block::Body if self.line == 0 && line.trim_end() == "---" => {
+            Block::Body if self.line == 0 && line.trim_start_matches('\u{feff}').trim_end() == "---" => {
                 (whole(t.text_2), Block::Frontmatter)
             }
             Block::Body => match opens {

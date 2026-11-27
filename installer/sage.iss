@@ -72,5 +72,7 @@ Root: HKCU; Subkey: "Software\Classes\Applications\sage.exe"; ValueType: string;
 Root: HKCU; Subkey: "Software\Classes\Applications\sage.exe\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\sage.exe,0"
 Root: HKCU; Subkey: "Software\Classes\Applications\sage.exe\SupportedTypes"; ValueType: string; ValueName: ".md"; ValueData: ""
 Root: HKCU; Subkey: "Software\Classes\Applications\sage.exe\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\sage.exe"" ""%1"""
+; Toasts for task reminders: Windows shows them only for a registered app id.
+Root: HKCU; Subkey: "Software\Classes\AppUserModelId\Sage.Sage"; ValueType: string; ValueName: "DisplayName"; ValueData: "Sage"; Flags: uninsdeletekey
 ; Settings > Apps: Inno Setup writes its own entry (with NoModify and
 ; NoRepair) under ...\Uninstall\{AppId}_is1.

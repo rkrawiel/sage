@@ -357,3 +357,42 @@ fn other_task_states_are_ticked_boxes() {
     assert_eq!(rest[1].task, None, "two characters are not a state");
     assert_eq!(rest[2], Item { task: Some(Task { done: true, line: 6 }), blocks: vec![] });
 }
+
+#[test]
+fn very_deep_quotes_and_lists_are_flattened_instead_of_overflowing_the_stack() {
+    fn depth(blocks: &[Block]) -> usize {
+        let item = |items: &[Item]| items.iter().map(|i| depth(&i.blocks)).max().unwrap_or(0);
+        blocks
+            .iter()
+            .map(|b| match b {
+                Block::Quote(inner) | Block::Callout { blocks: inner, .. } => 1 + depth(inner),
+                Block::List { items, .. } => 1 + item(items),
+                _ => 0,
+            })
+            .max()
+            .unwrap_or(0)
+    }
+    fn text(blocks: &[Block], out: &mut String) {
+        for b in blocks {
+            match b {
+                Block::Paragraph(inline) => out.push_str(&text_of(inline)),
+                Block::Quote(inner) | Block::Callout { blocks: inner, .. } => text(inner, out),
+                Block::List { items, .. } => items.iter().for_each(|i| text(&i.blocks, out)),
+                _ => {}
+            }
+        }
+    }
+    let callouts: String = (1..=300).map(|n| format!("{} [!note] level\n", ">".repeat(n))).collect();
+    let sources = [format!("{} deep\n", ">".repeat(10_000)), format!("{}deep\n", "- ".repeat(10_000)), callouts];
+    // The main thread on Windows has 1 MB of stack.
+    let run = move || {
+        for src in &sources {
+            let blocks = parse(src);
+            assert!(depth(&blocks) <= 64, "{}", depth(&blocks));
+            let mut all = String::new();
+            text(&blocks, &mut all);
+            assert!(all.contains("deep") || all.contains("level"), "the deepest content is kept");
+        }
+    };
+    std::thread::Builder::new().stack_size(1 << 20).spawn(run).unwrap().join().unwrap();
+}

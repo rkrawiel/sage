@@ -69,9 +69,16 @@ pub fn view<'a>(
     for folder in folders {
         open_node(&mut root, folder, expanded);
     }
+    // Notes come ordered by path, so a closed folder's notes mostly come one
+    // after another, and one lookup does for all of them.
+    let mut closed: Option<&str> = None;
     for file in files {
-        if let Some(node) = open_node(&mut root, &file.folder, expanded) {
-            node.files.push(file);
+        if closed == Some(file.folder.as_str()) {
+            continue;
+        }
+        match open_node(&mut root, &file.folder, expanded) {
+            Some(node) => node.files.push(file),
+            None => closed = Some(&file.folder),
         }
     }
     sort_files(&mut root, order);
@@ -92,13 +99,23 @@ fn open_node<'n, 'a>(root: &'n mut Node<'a>, folder: &'a str, expanded: &HashSet
     let mut end = 0;
     for part in folder.split('/') {
         end += part.len();
-        node = &mut node.folders.entry(part.to_lowercase()).or_insert_with(|| (part, Node::default())).1;
+        node = &mut child(node, part).1;
         if !expanded.contains(&folder[..end]) {
             return None;
         }
         end += 1;
     }
     Some(node)
+}
+
+/// The folder `part` of `node`, made if it is new. Most folder names are
+/// lowercase already, and then the map is searched without making a key.
+fn child<'n, 'a>(node: &'n mut Node<'a>, part: &'a str) -> &'n mut (&'a str, Node<'a>) {
+    let lowercase = part.chars().all(|c| c.to_lowercase().eq([c]));
+    if lowercase && node.folders.contains_key(part) {
+        return node.folders.get_mut(part).expect("the folder was just found");
+    }
+    node.folders.entry(part.to_lowercase()).or_insert_with(|| (part, Node::default()))
 }
 
 /// The buttons above the tree, and the order choices while they are open.
@@ -306,5 +323,16 @@ mod tests {
         assert!(root.folders["projects"].1.folders.is_empty(), "the closed folder shows as a row only");
         let open = HashSet::from(["Projects".to_owned(), "Projects/Deep".to_owned(), "Projects/Deep/Deeper".to_owned()]);
         assert!(open_node(&mut root, "Projects/Deep/Deeper", &open).is_some());
+    }
+
+    #[test]
+    fn folders_differing_only_in_case_share_a_node() {
+        let mut root = Node::default();
+        let open = HashSet::from(["daily".to_owned(), "Daily".to_owned()]);
+        assert!(open_node(&mut root, "daily", &open).is_some());
+        assert!(open_node(&mut root, "Daily", &open).is_some());
+        assert!(open_node(&mut root, "ünïcode", &open).is_none());
+        assert_eq!(root.folders.keys().collect::<Vec<_>>(), ["daily", "ünïcode"]);
+        assert_eq!(root.folders["daily"].0, "daily", "the first spelling seen is shown");
     }
 }

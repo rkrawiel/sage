@@ -12,31 +12,36 @@ use iced::Task;
 use std::path::{Path, PathBuf};
 
 impl App {
-    /// The palette command and the settings button: asks for a folder.
+    /// The palette command and the settings button: asks for a folder, and
+    /// checks it, off the UI thread, as a folder on a network drive can be
+    /// slow to look at.
     pub(crate) fn open_vault(&mut self) -> Task<Message> {
         if let Some(notice) = blocked(&self.conflicts()) {
             self.notice(notice);
             return Task::none();
         }
+        let current = self.vault.clone();
         Task::perform(
-            async { tokio::task::spawn_blocking(pick).await.unwrap_or_else(|e| Err(e.to_string())) },
+            async move {
+                tokio::task::spawn_blocking(move || match pick() {
+                    Ok(Some(chosen)) => check(&current, &chosen).map(Some),
+                    Ok(None) => Ok(None),
+                    Err(error) => Err(format!("No folder picker: {error}")),
+                })
+                .await
+                .unwrap_or_else(|e| Err(e.to_string()))
+            },
             Message::VaultPicked,
         )
     }
 
-    /// A folder chosen, or the picker cancelled or missing. Unsaved notes and
-    /// settings are saved before the switch, which looks again once they are.
+    /// A folder chosen and found usable, or the picker cancelled, missing or
+    /// the folder refused, with why. Unsaved notes and settings are saved
+    /// before the switch, which looks again once they are.
     pub(crate) fn vault_picked(&mut self, picked: Result<Option<PathBuf>, String>) -> Task<Message> {
-        let chosen = match picked {
-            Ok(Some(chosen)) => chosen,
+        let vault = match picked {
+            Ok(Some(vault)) => vault,
             Ok(None) => return Task::none(),
-            Err(error) => {
-                self.notice(format!("No folder picker: {error}"));
-                return Task::none();
-            }
-        };
-        let vault = match check(&self.vault, &chosen) {
-            Ok(vault) => vault,
             Err(error) => {
                 self.notice(error);
                 return Task::none();

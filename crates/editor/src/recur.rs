@@ -4,7 +4,8 @@
 //! The rule is read from `🔁 every week` or a Dataview `[repeat:: every week]`
 //! field. The next date follows from the due date, else the scheduled date,
 //! else the start date, or from today for a rule ending in `when done`; every
-//! date on the line moves by the same number of days.
+//! date on the line, a reminder's `(@2026-12-01 09:30)` included, moves by the
+//! same number of days, so the next occurrence does not remind at once.
 
 use chrono::{Datelike, Days, Months, NaiveDate, TimeDelta, Weekday};
 use regex::{Captures, Regex};
@@ -16,7 +17,7 @@ static RULE: LazyLock<Regex> = LazyLock::new(|| {
 });
 /// A date the next occurrence moves, in either format.
 static DATE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"((?:📅|⏳|🛫)\s*|[\[\(](?:due|scheduled|start)::\s*)(\d{4}-\d{2}-\d{2})").unwrap()
+    Regex::new(r"((?:📅|⏳|🛫)\s*|[\[\(](?:due|scheduled|start)::\s*|\(@)(\d{4}-\d{2}-\d{2})").unwrap()
 });
 /// A completion date, with the space before it.
 static DONE: LazyLock<Regex> = LazyLock::new(|| {
@@ -226,6 +227,11 @@ mod tests {
     #[test]
     fn next_occurrence_moves_every_date() {
         let today = d("2026-11-16");
+        assert_eq!(
+            next_occurrence("- [ ] Call mum 🔁 every week 📅 2026-11-13 (@2026-11-13 18:30)", today).as_deref(),
+            Some("- [ ] Call mum 🔁 every week 📅 2026-11-20 (@2026-11-20 18:30)"),
+            "the reminder moves with the due date and keeps its time"
+        );
         assert_eq!(
             next_occurrence("- [ ] Water plants 🔁 every week 🛫 2026-11-10 ⏳ 2026-11-12 📅 2026-11-13 ^w1", today).as_deref(),
             Some("- [ ] Water plants 🔁 every week 🛫 2026-11-17 ⏳ 2026-11-19 📅 2026-11-20")

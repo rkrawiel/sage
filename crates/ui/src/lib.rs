@@ -6,17 +6,21 @@
 //! The indexer runs on its own thread, started by a subscription. Reads and
 //! saves run as tasks on the async runtime, blocking work on its blocking pool.
 
+mod flow;
 mod highlight;
 mod live;
 mod live_editor;
+mod notify;
 mod omni;
 mod order;
 mod preview;
 mod settings;
 mod suggest;
+mod tables;
 mod task_form;
 mod tasks;
 pub mod theme;
+mod timeline;
 mod tree;
 mod store;
 mod vault;
@@ -87,6 +91,20 @@ const HISTORY: usize = 100;
 const RECENT: usize = 20;
 /// The widest the note is in focus mode.
 const FOCUS_WIDTH: f32 = 820.0;
+/// Every autosave changes the index: the active note's views run again for
+/// that at most this often, however fast the changes come.
+const PREVIEWS_EVERY: Duration = Duration::from_millis(300);
+/// How many renames Undo last rename can still revert. Each keeps the text
+/// of every note it rewrote, before and after.
+const RENAMES: usize = 10;
+
+/// A number nothing has had before. Names a tab, so that work done for it
+/// off the UI thread finds it again even after its note was renamed, and a
+/// request, so that an answer to an older one is known as stale.
+fn unique() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
 
 pub fn run(vault: PathBuf) -> anyhow::Result<()> {
     run_with(vault, None)
@@ -157,8 +175,8 @@ enum Message {
     WindowUnfocused,
     /// Time to stat the open notes again (polled vaults only).
     PollTabs,
-    /// `(path, stamp)` of every open note; `None` if it could not be read.
-    Polled(Vec<(String, Option<Stamp>)>),
+    /// `(tab, path, stamp)` of every open note; `None` if it could not be read.
+    Polled(Vec<(u64, String, Option<Stamp>)>),
     /// One conflict in the resolve panel decided.
     Choose(usize, Choice),
     /// Every conflict in the resolve panel decided the same way.
@@ -167,15 +185,21 @@ enum Message {
     CancelResolve,
     /// Compare a OneDrive conflict copy with the active note.
     CompareCopy(String),
-    CopyLoaded { tab: String, copy: String, result: Result<String, String> },
+    /// Results of work done off the UI thread for a tab name it by `Tab::id`,
+    /// never by path: the note may have been renamed meanwhile, and blank
+    /// tabs all share the empty path.
+    CopyLoaded { tab: u64, copy: String, result: Result<String, String> },
     SystemTheme(iced::theme::Mode),
     Open(String),
     /// Opens a note with the cursor on a line, from the task list.
     OpenAt(String, usize),
     FollowLink(LinkTarget),
-    Loaded(String, Result<String, String>),
-    Saved { path: String, seq: u64, result: Result<String, SaveError> },
+    /// A note read for tab `tab`, from `path`.
+    Loaded { tab: u64, path: String, result: Result<String, String> },
+    /// A save of tab `tab` to `path` finished.
+    Saved { tab: u64, path: String, seq: u64, result: Result<String, SaveError> },
     Created(Result<String, String>),
+    StarterCreated(Result<sage_editor::starter::Written, String>),
     Trashed(String, Result<String, String>),
     Renamed(Result<Arc<Rename>, String>),
     /// The rename undone, with each restored note's path and text.
@@ -199,15 +223,21 @@ enum Message {
     CancelDelete,
     TaskFormTitle(String),
     TaskFormDue(String),
+    TaskFormRemind(String),
+    /// A system notification was shown, or why not.
+    Notified(Result<(), String>),
+    SettingsNotifications(bool),
+    SettingsReminderTime(String),
     TaskFormSubmit,
     /// A task note was created, to be linked in `tab`: its path and id.
-    TaskNoteCreated { tab: Option<String>, result: Result<(String, String), String> },
+    TaskNoteCreated { tab: Option<u64>, result: Result<(String, String), String> },
     /// A divider pressed, the pointer moved while dragging it to `x`, and the
     /// window's new width.
     ResizeStart(Divider),
     ResizeMove(f32),
     WindowWidth(f32),
-    /// A web or mail link was handed to the desktop, or could not be.
+    /// A web or mail link, or a file to reveal, was handed to the desktop, or
+    /// could not be.
     UrlOpened(Result<(), String>),
     /// A foldable callout in the active note's preview opened or closed: its
     /// key, and whether it is now open.
@@ -243,6 +273,20 @@ enum Message {
     QuickNoteDone { result: Result<(String, bool), String>, open: bool },
     /// Text captured into a note: its path and new text.
     Captured { path: String, result: Result<String, String> },
+    /// A note written by a workflow: its path and new text, what to tell the
+    /// user, and a note to open afterwards.
+    Written { path: String, result: Result<String, String>, done: String, open: Option<String> },
+    /// The lines of today's daily note that are not sorted yet.
+    TriageLoaded(Result<Vec<flow::Line>, String>),
+    /// Text read off the clipboard for an import.
+    ImportText(Option<String>),
+    /// The timeline's kind filter.
+    TimelineKind(Option<&'static str>),
+    /// The timeline of tab `tab`'s note at `path`, read as request `asked`;
+    /// `None` when the index could not be read, and the timeline shown stays.
+    TimelineLoaded { tab: u64, path: String, asked: u64, rows: Option<Vec<timeline::Entry>> },
+    /// The Daily notes settings, read for Ctrl+D.
+    DailyFound(sage_editor::obsidian::Daily),
     ToggleTask(usize),
     /// A task checkbox in the preview of the active note, by source line.
     PreviewTask(u32),
@@ -250,7 +294,7 @@ enum Message {
     ViewTask(TaskRef),
     /// A task line rewritten on disk: the note's new text.
     TaskWritten { path: String, result: Result<String, String> },
-    EmbedLoaded { tab: String, key: String, embedded: Embedded },
+    EmbedLoaded { tab: u64, key: String, embedded: Embedded },
     /// A Kanban card pressed: the start of a drag, or a click.
     Grab { view: String, card: TaskRef, key: String, column: usize, index: usize },
     DragOver(String, usize),
@@ -260,7 +304,7 @@ enum Message {
     DragCardLeave(String, usize, usize),
     MouseUp,
     TemplatesFound(Result<TemplateConfig, String>),
-    TemplateLoaded { target: String, config: TemplateConfig, result: Result<String, String> },
+    TemplateLoaded { target: u64, config: TemplateConfig, result: Result<String, String> },
     SelectTab(usize),
     CloseTab(usize),
     TabMenu(usize),
@@ -278,6 +322,8 @@ enum Message {
     TaskFilter(tasks::Filter),
     ShortcutFilter(String),
     SettingsTrackedOnly(bool),
+    /// Task notes closed because the checkbox linking them was checked.
+    TaskNotesClosed(Vec<String>),
     /// Once a second while a toast shows, so it goes away by itself.
     ToastTick,
     CloseAllTabs,
@@ -290,9 +336,9 @@ enum Message {
     PasteImage,
     /// A file dropped on the window.
     FileDropped(PathBuf),
-    /// A picture saved into the vault for the note at `tab`: its vault path,
-    /// or `None` when the clipboard held no picture.
-    Attached { tab: String, result: Result<Option<String>, String> },
+    /// A picture saved into the vault for the note in tab `tab`: its vault
+    /// path, or `None` when the clipboard held no picture.
+    Attached { tab: u64, result: Result<Option<String>, String> },
     /// A heading in the outline clicked: its line.
     OutlineJump(usize),
     MenuReveal,
@@ -333,6 +379,8 @@ enum Message {
     PropertyBlur(usize, usize, bool),
     /// A new, empty item at the end of a list.
     PropertyAdd(usize),
+    /// A change to the table that starts on the given line, in live preview.
+    Table(usize, tables::Edit),
     Tick,
     CompleteMove(i32),
     CompletePick(usize),
@@ -346,8 +394,8 @@ enum Message {
     PaletteClick(usize),
     Key(Shortcut),
     Modifiers(keyboard::Modifiers),
-    /// Ask for another vault's folder; the folder chosen, `None` if
-    /// cancelled; switch to it once unsaved notes are written.
+    /// Ask for another vault's folder; the folder chosen and checked, `None`
+    /// if cancelled; switch to it once unsaved notes are written.
     OpenVault,
     VaultPicked(Result<Option<PathBuf>, String>),
     SwitchVault(PathBuf),
@@ -429,15 +477,32 @@ enum Command {
     TogglePalette,
     SearchEverywhere,
     CloseActiveTab,
+    /// A blank tab, from which a note is opened or created.
+    NewTab,
+    /// Finds a note and opens it in the current tab.
+    OpenNote,
     Find,
     RenameNote,
     RenameFolder,
+    MoveNote,
     UndoRename,
     InsertTemplate,
     ToggleTasks,
     NewInlineTask,
     /// Makes the line a task and offers the people to follow up with.
     FollowUp,
+    /// The same, for something awaited from somebody: tagged `#waiting` with the day it began.
+    WaitingFor,
+    /// Adds a dated line to a project's log.
+    LogToProject,
+    /// Turns the log line under the cursor into a note of its own.
+    PromoteLog,
+    /// Files, makes a task of, or follows up the loose lines of today's daily note.
+    Triage,
+    /// Turns the text on the clipboard, an email or meeting notes, into an event.
+    ImportEvent,
+    /// This week's review note, made if it is missing.
+    WeeklyReview,
     NewTaskNote,
     QuickAdd,
     ToggleSettings,
@@ -454,10 +519,12 @@ enum Command {
     ZoomReset,
     /// The list of keyboard shortcuts and tricks.
     Shortcuts,
+    /// Writes the starter vault's folders, templates and tutorial, keeping every file that exists.
+    CreateStarterVault,
 }
 
 /// The commands the palette offers, by name.
-const COMMANDS: [(&str, Command); 35] = [
+const COMMANDS: [(&str, Command); 45] = [
     ("Keyboard shortcuts", Command::Shortcuts),
     ("Save note", Command::Save),
     ("Search everywhere", Command::SearchEverywhere),
@@ -465,11 +532,18 @@ const COMMANDS: [(&str, Command); 35] = [
     ("Find in note", Command::Find),
     ("Rename or move note", Command::RenameNote),
     ("Rename or move this note's folder", Command::RenameFolder),
+    ("Move note to folder", Command::MoveNote),
     ("Undo last rename", Command::UndoRename),
     ("Insert template", Command::InsertTemplate),
     ("Show tasks", Command::ToggleTasks),
     ("New task line", Command::NewInlineTask),
     ("Follow up with a person", Command::FollowUp),
+    ("Waiting for a person", Command::WaitingFor),
+    ("Log to project", Command::LogToProject),
+    ("Promote log line to a note", Command::PromoteLog),
+    ("Triage the daily note", Command::Triage),
+    ("Import email or meeting notes from the clipboard", Command::ImportEvent),
+    ("Weekly review", Command::WeeklyReview),
     ("New task note", Command::NewTaskNote),
     ("Quick add", Command::QuickAdd),
     ("Settings", Command::ToggleSettings),
@@ -482,6 +556,8 @@ const COMMANDS: [(&str, Command); 35] = [
     ("View: preview", Command::View(ViewMode::Preview)),
     ("Toggle light and dark theme", Command::ToggleTheme),
     ("Close tab", Command::CloseActiveTab),
+    ("New tab", Command::NewTab),
+    ("Open note", Command::OpenNote),
     ("Delete note (move to .trash)", Command::DeleteNote),
     ("Overwrite file on disk with this tab", Command::ForceSave),
     ("Go back", Command::Back),
@@ -493,13 +569,16 @@ const COMMANDS: [(&str, Command); 35] = [
     ("Zoom in", Command::ZoomIn),
     ("Zoom out", Command::ZoomOut),
     ("Reset zoom", Command::ZoomReset),
+    ("Create starter vault: folders, templates and tutorial", Command::CreateStarterVault),
 ];
 
 /// Sage's own shortcuts: what the keyboard runs, what the palette shows
 /// beside each command, and what the shortcuts settings list.
-const BUILT_IN: [(&str, Command); 22] = [
+const BUILT_IN: [(&str, Command); 28] = [
     ("F1", Command::Shortcuts),
     ("Ctrl+P", Command::TogglePalette),
+    ("Ctrl+O", Command::OpenNote),
+    ("Ctrl+Shift+A", Command::NewTab),
     ("Ctrl+Shift+F", Command::SearchEverywhere),
     ("Ctrl+S", Command::Save),
     ("Ctrl+N", Command::NewNote),
@@ -508,11 +587,15 @@ const BUILT_IN: [(&str, Command); 22] = [
     ("Ctrl+T", Command::NewTaskNote),
     ("Ctrl+Shift+T", Command::NewInlineTask),
     ("Ctrl+Shift+J", Command::FollowUp),
+    ("Ctrl+Shift+W", Command::WaitingFor),
+    ("Ctrl+L", Command::LogToProject),
+    ("Ctrl+Shift+I", Command::Triage),
     ("Ctrl+E", Command::CycleView),
     ("Ctrl+Shift+E", Command::ToggleLive),
     ("Ctrl+W", Command::CloseActiveTab),
     ("Ctrl+Shift+L", Command::ToggleTheme),
     ("F2", Command::RenameNote),
+    ("Ctrl+M", Command::MoveNote),
     ("Ctrl+D", Command::DailyNote),
     ("Ctrl+Shift+R", Command::ReopenTab),
     ("Ctrl+Shift+O", Command::ToggleOutline),
@@ -627,6 +710,9 @@ struct Session {
     outline: bool,
     /// The interface's size, 1.0 as designed.
     zoom: Option<f32>,
+    /// When reminders were last looked at, `YYYY-MM-DDTHH:MM:SS` local time:
+    /// the next start tells the ones that went off since.
+    reminders_checked: Option<String>,
 }
 
 /// The sizes of the panes, set by dragging the dividers between them.
@@ -664,10 +750,16 @@ struct Doomed {
 struct Toast {
     text: String,
     undo: Option<(String, String)>,
+    /// A reminder's task, `(path, line)`, which Open goes to.
+    open: Option<(String, Option<u32>)>,
     until: Instant,
 }
 
 const TOAST_FOR: Duration = Duration::from_secs(6);
+/// A reminder's toast stays longer than a notice, to be read and opened.
+const REMINDER_TOAST_FOR: Duration = Duration::from_secs(30);
+/// How the session stores when reminders were last looked at.
+const CHECKED_FORMAT: &str = "%Y-%m-%dT%H:%M:%S";
 
 struct App {
     vault: PathBuf,
@@ -681,6 +773,15 @@ struct App {
     files: Vec<FileRow>,
     /// Every folder on disk, so one without notes still shows in the tree.
     disk_folders: Vec<String>,
+    /// The folders that hold notes, and those with the folders on disk added,
+    /// sorted: made again when `files` or `disk_folders` change rather than
+    /// on every frame. See `folder_lists`.
+    note_folders: Vec<String>,
+    tree_folders: Vec<String>,
+    /// The folders on disk are being listed; list them again once that is
+    /// done, as the vault changed meanwhile.
+    scanning: bool,
+    rescan: bool,
     expanded: HashSet<String>,
     tree_order: tree::Order,
     /// The tree's order choices are showing.
@@ -700,6 +801,8 @@ struct App {
     escape_used: bool,
     /// Suggestions under a field of the properties widget.
     prop_complete: Option<PropCompletion>,
+    /// The table cell being typed in, as typed, so spaces at its ends survive until the field is left.
+    table_draft: Option<tables::Draft>,
     /// The name being typed for a new property.
     new_property: Option<(sage_editor::properties::PropType, String)>,
     /// The property whose list of types is open.
@@ -738,6 +841,8 @@ struct App {
     tabs_shown: (usize, usize),
     /// Whether the start-up note has been dealt with.
     startup_done: bool,
+    /// Whether the indexer has finished a pass, so an empty file list means an empty vault.
+    indexed: bool,
     /// A deletion waiting for the user to confirm it.
     doomed: Option<Doomed>,
     /// The list of shortcuts, while it is open.
@@ -746,6 +851,13 @@ struct App {
     shortcut_filter: String,
     /// A message floating over the page for a few seconds, with Undo when it can.
     toast: Option<Toast>,
+    /// Open tasks with reminders, read from the index after each change.
+    reminders: Vec<sage_editor::reminders::Reminder>,
+    /// When reminders were last looked at; kept in the session.
+    reminders_checked: Option<chrono::NaiveDateTime>,
+    /// Whether the first look since Sage started, which gathers the
+    /// reminders missed while it was closed, has happened.
+    reminders_caught_up: bool,
     /// Notes whose tabs stay at the left and ignore Close others and Close all.
     pinned: Vec<String>,
     /// The new-task form, while it is open.
@@ -770,7 +882,10 @@ struct App {
     closing: bool,
     /// The date views last ran on, `YYYY-MM-DD`.
     day: String,
-    /// The active note's preview or outline waits for typing to pause.
+    /// The timeline panel's kind filter; `None` shows every kind.
+    timeline_kind: Option<&'static str>,
+    /// The active note's preview or outline waits for typing to pause, or
+    /// its views for `PREVIEWS_EVERY` to pass; a clock comes back for them.
     settling: bool,
     /// The left button went down in the source editor and has not come up.
     /// iced's editor keeps dragging until it sees the release itself, so one
@@ -786,6 +901,13 @@ struct App {
     polling: bool,
     /// A rename waiting for the index to catch up with the disk, by sync id.
     pending_rename: Option<(u64, Move)>,
+    /// A rename, or the undoing of one, under way off the UI thread. Notes it
+    /// moves are not saved until it is done: a save would write the path the
+    /// note is being moved away from. See `rename_holds`.
+    renaming: Option<Move>,
+    /// When views, task lists and documents last ran again for a change in
+    /// the index. Bursts of changes run them at most every `PREVIEWS_EVERY`.
+    previews_run: Instant,
     next_sync: u64,
     status: String,
     /// Index progress leaves `status` alone until then; see `notice`.
@@ -857,6 +979,9 @@ pub(crate) struct FileRow {
 }
 
 struct Tab {
+    /// Never shared with another tab, and kept for the tab's life whatever
+    /// note it shows; see [`unique`].
+    id: u64,
     path: String,
     title: String,
     content: text_editor::Content,
@@ -871,6 +996,9 @@ struct Tab {
     saving: bool,
     /// Incremented on every edit; tells a finished save whether newer edits exist.
     edit_seq: u64,
+    /// Names the text in `content`, new whenever it changes, read from disk
+    /// or edited; live preview lays out again only when it differs.
+    revision: u64,
     last_edit: Instant,
     /// The parsed note, rebuilt on edit instead of on every frame.
     preview: Vec<sage_markdown::Block>,
@@ -906,6 +1034,8 @@ struct Tab {
     backlinks: Vec<(String, String)>,
     /// Open `#followup` tasks elsewhere in the vault that link to this note.
     followups: Vec<tasks::TaskRow>,
+    /// Dated log lines in this note, or linking to it.
+    timeline: Vec<timeline::Entry>,
     outgoing: Vec<Outgoing>,
     /// Where the cursor goes once the first read finishes.
     jump: Option<Jump>,
@@ -918,15 +1048,27 @@ struct Tab {
     copies: Vec<String>,
     /// The note's headings for the outline: level, text and line.
     outline: Vec<(u8, String, usize)>,
-    /// Words and characters in the note, for the status bar.
+    /// Words and characters in the note, for the status bar, and the
+    /// `revision` they were counted for. Counted again once typing pauses
+    /// (`catch_up`), not on every key.
     counts: (usize, usize),
+    counted: u64,
+    /// The index changed; views, task lists and documents run again once the
+    /// tab is shown, at most every `PREVIEWS_EVERY`.
+    index_stale: bool,
+    /// The last timeline read asked for, by `unique` number; an older one
+    /// that comes back later is dropped.
+    timeline_asked: u64,
     /// Undo and redo for this note's edits.
     history: sage_editor::undo::History,
+    /// This is the task list's tab, not a note.
+    tasks: bool,
 }
 
 impl Tab {
     fn placeholder(path: String, title: String) -> Self {
         Self {
+            id: unique(),
             path,
             title,
             content: text_editor::Content::new(),
@@ -936,6 +1078,7 @@ impl Tab {
             conflict: false,
             saving: false,
             edit_seq: 0,
+            revision: live_editor::next_revision(),
             last_edit: Instant::now(),
             preview: Vec::new(),
             islands: Vec::new(),
@@ -952,6 +1095,7 @@ impl Tab {
             links_stale: false,
             backlinks: Vec::new(),
             followups: Vec::new(),
+            timeline: Vec::new(),
             outgoing: Vec::new(),
             jump: None,
             disk_stamp: None,
@@ -960,8 +1104,27 @@ impl Tab {
             copies: Vec::new(),
             outline: Vec::new(),
             counts: (0, 0),
+            counted: 0,
+            index_stale: false,
+            timeline_asked: 0,
             history: sage_editor::undo::History::default(),
+            tasks: false,
         }
+    }
+
+    /// A tab that shows no note yet, only the choice of what to open. Its
+    /// path is empty.
+    fn blank() -> Self {
+        Self::placeholder(String::new(), "New tab".to_owned())
+    }
+
+    /// The tab the task list is shown in. Like a blank tab its path is empty.
+    fn tasks() -> Self {
+        Self { tasks: true, ..Self::placeholder(String::new(), "Tasks".to_owned()) }
+    }
+
+    fn is_blank(&self) -> bool {
+        self.path.is_empty() && !self.tasks
     }
 
     fn snapshot(&self) -> sage_editor::undo::Snapshot {
@@ -1010,12 +1173,14 @@ impl Tab {
         // Text from disk or a merge: earlier steps no longer apply to it.
         self.history.clear();
         self.content = text_editor::Content::with_text(&text);
+        self.revision = live_editor::next_revision();
         let started = Instant::now();
         self.preview = sage_markdown::parse(&text);
         (self.parse_cost, self.parsed_at) = (started.elapsed(), Instant::now());
-        self.islands = live::islands(&text);
+        self.islands = live::islands(&text, std::mem::take(&mut self.islands));
         self.outline = outline(&text);
         self.counts = counts(&text);
+        self.counted = self.revision;
         self.stale = true;
         self.unparsed = false;
         self.islands_stale = false;
@@ -1029,8 +1194,8 @@ impl Tab {
     fn mark_edited(&mut self) {
         self.dirty = true;
         self.edit_seq += 1;
+        self.revision = live_editor::next_revision();
         self.last_edit = Instant::now();
-        self.counts = counts(&self.content.text());
         self.unparsed = true;
         self.islands_stale = true;
         self.outline_stale = true;
@@ -1046,21 +1211,36 @@ impl Tab {
     /// the text at once. The preview and outline of a note that is slow to
     /// parse wait while typing goes on (`parse_waits`). Returns whether
     /// something is still waiting.
+    ///
+    /// The words and characters in the status bar are counted once typing
+    /// pauses, in any note: counting is a pass over the whole text, copied
+    /// out of the editor for it, which is not worth doing on every key. They
+    /// need no clock of their own: an edit leaves the note unsaved, and the
+    /// autosave tick comes by twice a second until it is saved.
     fn catch_up(&mut self, preview: bool, live: bool, outline_open: bool) -> bool {
         let islands = live && self.islands_stale;
         let waits = parse_waits(self.parse_cost, self.last_edit.elapsed(), self.parsed_at.elapsed());
         let preview = preview && self.unparsed;
         let outline_open = outline_open && self.outline_stale;
-        if !islands && (waits || (!preview && !outline_open)) {
-            return waits && (preview || outline_open);
+        let uncounted = self.loaded && self.counted != self.revision;
+        let count = uncounted && self.last_edit.elapsed() >= PARSE_SETTLE;
+        let parse = !waits && (preview || outline_open);
+        let waiting = waits && (preview || outline_open);
+        if !islands && !parse && !count {
+            return waiting;
         }
+        // One copy of the text for everything that needs it.
         let text = self.content.text();
         if islands {
-            self.islands = live::islands(&text);
+            self.islands = live::islands(&text, std::mem::take(&mut self.islands));
             self.islands_stale = false;
         }
-        if waits {
-            return preview || outline_open;
+        if count {
+            self.counts = counts(&text);
+            self.counted = self.revision;
+        }
+        if !parse {
+            return waiting;
         }
         if preview {
             let started = Instant::now();
@@ -1073,7 +1253,7 @@ impl Tab {
             self.outline = outline(&text);
             self.outline_stale = false;
         }
-        false
+        waiting
     }
 
     /// Replaces one line of the text in the editor, leaving the cursor where it
@@ -1094,12 +1274,7 @@ impl Tab {
     /// The frontmatter's own lines, between the `---` fences, with the line
     /// the first of them is on, or `None` when the note has none.
     fn frontmatter_lines(&self) -> Option<Vec<String>> {
-        let lines = self.lines();
-        if lines.first().map(|l| l.trim_end()) != Some("---") {
-            return None;
-        }
-        let close = lines[1..].iter().position(|l| matches!(l.trim_end(), "---" | "..."))?;
-        Some(lines[1..1 + close].to_vec())
+        frontmatter_in(|i| self.content.line(i).map(|l| l.text.into_owned()))
     }
 
     /// Entry `index` of the frontmatter.
@@ -1201,11 +1376,6 @@ impl Tab {
         let text = self.with_ending(text);
         self.content.perform(text_editor::Action::Edit(Edit::Paste(Arc::new(text))));
         self.mark_edited();
-    }
-
-    /// The editor's lines, for the editing commands.
-    fn lines(&self) -> Vec<String> {
-        (0..self.content.line_count()).filter_map(|i| self.content.line(i)).map(|l| l.text.into_owned()).collect()
     }
 
     /// The selection as the editing commands see it: anchor and cursor.
@@ -1368,6 +1538,9 @@ struct Palette {
     query: String,
     hits: Vec<Hit>,
     selected: usize,
+    /// The project or people notes a flow picks from, as `(name, path)`,
+    /// read once as it opens rather than on every key (`flow::open_flow`).
+    kind_notes: Vec<(String, String)>,
 }
 
 #[derive(Default)]
@@ -1379,6 +1552,8 @@ enum PaletteMode {
     Rename(String),
     /// The query is the new path for the folder at this path.
     RenameFolder(String),
+    /// The query filters the folders the note at this path can move to.
+    MoveTo(String),
     Template(TemplateConfig),
     /// The Quick Add entries, filtered by the query.
     QuickAdd,
@@ -1391,6 +1566,16 @@ enum PaletteMode {
     /// Fuzzy search over every note's metadata and text, read off the UI
     /// thread when it opened; `None` until it has been.
     Everywhere(Option<Arc<omni::Corpus>>),
+    /// The query filters the projects to do something with.
+    Project(flow::Then),
+    /// The query is what happened, as `kind: text`, for the project at this path.
+    LogEntry { project: String, source: Option<flow::Line> },
+    /// The query filters the loose lines of the daily note.
+    Triage(Vec<flow::Line>),
+    /// What to make of a line.
+    TriageAction(flow::Line),
+    /// The query filters the people a line is for.
+    Person(flow::Line, sage_editor::log::Triage),
 }
 
 struct Hit {
@@ -1414,6 +1599,8 @@ enum HitAction {
     QuickAdd(usize),
     /// Runs the Quick Add entry with this index with the query as its value.
     QuickAddRun(usize),
+    /// A step of a workflow in `flow`.
+    Flow(flow::Step),
     /// An explanation rather than a choice: Enter keeps the palette open.
     Nothing,
 }
@@ -1433,6 +1620,10 @@ impl App {
             dark_override: session.dark_override,
             files: Vec::new(),
             disk_folders: Vec::new(),
+            note_folders: Vec::new(),
+            tree_folders: Vec::new(),
+            scanning: false,
+            rescan: false,
             expanded: session.expanded.into_iter().collect(),
             tree_order: session.tree_order,
             tree_order_menu: false,
@@ -1443,6 +1634,7 @@ impl App {
             palette: None,
             completion: None,
             prop_complete: None,
+            table_draft: None,
             new_property: None,
             type_menu: None,
             chip_hover: None,
@@ -1465,10 +1657,17 @@ impl App {
             tab_menu: None,
             tabs_shown: (usize::MAX, 0),
             startup_done: false,
+            indexed: false,
             doomed: None,
             help: false,
             shortcut_filter: String::new(),
             toast: None,
+            reminders: Vec::new(),
+            reminders_checked: session
+                .reminders_checked
+                .as_deref()
+                .and_then(|t| chrono::NaiveDateTime::parse_from_str(t, CHECKED_FORMAT).ok()),
+            reminders_caught_up: false,
             pinned: session.pinned.clone(),
             task_form: None,
             recording: None,
@@ -1480,6 +1679,7 @@ impl App {
             settings_error: None,
             closing: false,
             day: sage_editor::today(),
+            timeline_kind: None,
             settling: false,
             left_down: false,
             obsidian_templates: TemplateConfig::default(),
@@ -1487,6 +1687,8 @@ impl App {
             onedrive: false,
             polling: false,
             pending_rename: None,
+            renaming: None,
+            previews_run: Instant::now(),
             next_sync: 0,
             status: "Opening index".into(),
             status_until: Instant::now(),
@@ -1512,9 +1714,14 @@ impl App {
         let mut tasks =
             vec![iced::system::theme().map(Message::SystemTheme), load_settings(app.vault.clone()), app.scan_folders()];
         for path in session.tabs {
+            if path.is_empty() {
+                app.tabs.push(Tab::blank());
+                continue;
+            }
             let title = app.title_of(&path);
-            tasks.push(app.read(&path));
-            app.tabs.push(Tab::placeholder(path, title));
+            let tab = Tab::placeholder(path, title);
+            tasks.push(app.read(tab.id, &tab.path));
+            app.tabs.push(tab);
         }
         app.active = session.active.min(app.tabs.len().saturating_sub(1));
         (app, Task::batch(tasks))
@@ -1639,13 +1846,13 @@ impl App {
                 let Some(tab) = self.tabs.get(self.active).filter(|t| t.loaded && t.merge.is_none()) else {
                     return Task::none();
                 };
-                let (tab, abs) = (tab.path.clone(), self.vault.join(&copy));
+                let (tab, abs) = (tab.id, self.vault.join(&copy));
                 return Task::perform(
                     async move { tokio::fs::read_to_string(&abs).await.map_err(|e| e.to_string()) },
-                    move |result| Message::CopyLoaded { tab: tab.clone(), copy: copy.clone(), result },
+                    move |result| Message::CopyLoaded { tab, copy: copy.clone(), result },
                 );
             }
-            Message::CopyLoaded { tab, copy, result: Ok(text) } => return self.compare_copy(&tab, copy, &text),
+            Message::CopyLoaded { tab, copy, result: Ok(text) } => return self.compare_copy(tab, copy, &text),
             Message::CopyLoaded { copy, result: Err(error), .. } => self.notice(format!("Could not read {copy}: {error}")),
             Message::SystemTheme(mode) => self.system_dark = mode == iced::theme::Mode::Dark,
             Message::Open(path) => {
@@ -1654,29 +1861,62 @@ impl App {
             }
             Message::OpenAt(path, line) => return self.open_at(path, Some(Jump::Line(line))),
             Message::FollowLink(link) => return self.follow(link),
-            Message::Loaded(path, result) => return self.on_loaded(path, result),
-            Message::Saved { path, seq, result } => return self.on_saved(path, seq, result),
+            Message::Loaded { tab, path, result } => return self.on_loaded(tab, path, result),
+            Message::Saved { tab, path, seq, result } => return self.on_saved(tab, path, seq, result),
             Message::Created(Ok(path)) => return self.open(path),
             Message::Created(Err(error)) => self.notice(format!("Could not create the note: {error}")),
+            Message::StarterCreated(Ok(written)) => {
+                let kept = match written.kept {
+                    0 => String::new(),
+                    n => format!(", {n} already there were kept"),
+                };
+                self.notice(format!("Starter vault: {} files written{kept}", written.created));
+                // The settings file on disk is now the truth, Quick Add shortcuts included.
+                self.settings_changed = None;
+                let open = self.open(sage_editor::starter::FIRST_NOTE.to_owned());
+                return Task::batch([load_settings(self.vault.clone()), self.scan_folders(), open]);
+            }
+            Message::StarterCreated(Err(error)) => self.notice(format!("Could not create the starter vault: {error}")),
             Message::Trashed(path, Ok(target)) => {
                 // A folder takes the notes in it along.
-                let gone = |p: &str| p == path || p.strip_prefix(&path).is_some_and(|rest| rest.starts_with('/'));
-                self.active = active_after(self.active, &self.tabs, |t| gone(&t.path));
-                self.tabs.retain(|t| !gone(&t.path));
-                self.folds.retain(|p, _| !gone(p));
+                let inside = |p: &str| p == path || p.strip_prefix(&path).is_some_and(|rest| rest.starts_with('/'));
+                // A tab that got edits while the move was under way keeps them:
+                // it stays open as in conflict, so autosave does not keep
+                // failing on a file that is gone. Force save writes it back.
+                let kept: Vec<String> = self.tabs.iter().filter(|t| t.busy() && inside(&t.path)).map(|t| t.path.clone()).collect();
+                let gone = |t: &Tab| inside(&t.path) && !t.busy();
+                self.active = active_after(self.active, &self.tabs, gone);
+                self.tabs.retain(|t| !gone(t));
+                for tab in self.tabs.iter_mut().filter(|t| inside(&t.path)) {
+                    tab.conflict = true;
+                }
+                self.folds.retain(|p, _| !inside(p) || kept.contains(p));
                 self.find = None;
-                self.notice(format!("Moved {path} to {target}"));
+                let warning = kept.first().map(|first| format!("; {first} has unsaved edits and stays open, Force save writes it back"));
+                self.notice(format!("Moved {path} to {target}{}", warning.as_deref().unwrap_or("")));
                 if let Some(toast) = &mut self.toast {
-                    toast.text = format!("Moved {path} to .trash");
+                    toast.text = format!("Moved {path} to .trash{}", warning.as_deref().unwrap_or(""));
                     toast.undo = Some((path.clone(), target.clone()));
                 }
                 self.persist();
             }
             Message::Trashed(path, Err(error)) => self.notice(format!("Could not move {path}: {error}")),
-            Message::Renamed(Ok(rename)) => self.on_renamed(rename),
-            Message::Renamed(Err(error)) => self.notice(format!("Not renamed: {error}")),
-            Message::RenameUndone(Ok((rename, restored))) => self.on_rename_undone(rename, restored),
-            Message::RenameUndone(Err(error)) => self.notice(format!("Could not undo the rename: {error}")),
+            Message::Renamed(Ok(rename)) => {
+                self.on_renamed(rename);
+                return self.rename_done();
+            }
+            Message::Renamed(Err(error)) => {
+                self.notice(format!("Not renamed: {error}"));
+                return self.rename_done();
+            }
+            Message::RenameUndone(Ok((rename, restored))) => {
+                self.on_rename_undone(rename, restored);
+                return self.rename_done();
+            }
+            Message::RenameUndone(Err(error)) => {
+                self.notice(format!("Could not undo the rename: {error}"));
+                return self.rename_done();
+            }
             Message::TreeMenu(path, folder) => {
                 self.tab_menu = None;
                 self.menu_at = pointer();
@@ -1697,15 +1937,21 @@ impl App {
                 self.persist();
             }
             Message::TreeFoldAll => {
-                let all = self.all_folders();
-                if all.iter().any(|f| self.expanded.contains(f)) {
+                if self.tree_folders.iter().any(|f| self.expanded.contains(f)) {
                     self.expanded.clear();
                 } else {
-                    self.expanded.extend(all);
+                    self.expanded.extend(self.tree_folders.iter().cloned());
                 }
                 self.persist();
             }
-            Message::DiskFolders(folders) => self.disk_folders = folders,
+            Message::DiskFolders(folders) => {
+                self.scanning = false;
+                self.disk_folders = folders;
+                self.refresh_folders();
+                if std::mem::take(&mut self.rescan) {
+                    return self.scan_folders();
+                }
+            }
             Message::FolderCreated(Ok(folder)) => {
                 for ancestor in tree::ancestors(&format!("{folder}/")) {
                     self.expanded.insert(ancestor.to_owned());
@@ -1726,7 +1972,12 @@ impl App {
                 }
             }
             Message::ConfirmDelete => {
-                if let Some(Doomed { path, .. }) = self.doomed.take() {
+                // Asked again: a note may have been edited since the question came up.
+                if let Some(Doomed { path, folder }) = self.doomed.take() {
+                    if let Some(busy) = self.busy_inside(&path, folder) {
+                        self.notice(format!("Save {busy} before deleting it"));
+                        return Task::none();
+                    }
                     return self.trash_file(path);
                 }
             }
@@ -1781,6 +2032,13 @@ impl App {
             Message::SettingsStartupNote(path) => {
                 self.settings.startup_note = path;
                 self.settings_edited();
+            }
+            Message::TaskNotesClosed(closed) => {
+                if let Some(first) = closed.first() {
+                    let more = if closed.len() > 1 { format!(" and {} more", closed.len() - 1) } else { String::new() };
+                    self.status = format!("Closed task note {first}{more}");
+                    self.load_tasks();
+                }
             }
             Message::SettingsTrackedOnly(on) => {
                 self.settings.tracked_tasks_only = on;
@@ -1866,6 +2124,30 @@ impl App {
                 self.notice(format!("Added to {path}"));
             }
             Message::Captured { result: Err(error), .. } => self.notice(format!("Quick Add: {error}")),
+            Message::Written { path, result, done, open } => match result {
+                Ok(text) => {
+                    if let Some(tab) = self.tabs.iter_mut().find(|t| t.path == path) {
+                        tab.follow_disk(text);
+                    }
+                    self.refresh_find(false);
+                    self.notice(done);
+                    if let Some(open) = open {
+                        return self.open(open);
+                    }
+                }
+                Err(error) => self.notice(error),
+            },
+            Message::TriageLoaded(result) => return self.triage_loaded(result),
+            Message::ImportText(text) => return self.import_text(text),
+            Message::TimelineKind(kind) => self.timeline_kind = kind,
+            Message::TimelineLoaded { tab, path, asked, rows: Some(rows) } => {
+                // Only the newest read for the note the tab still shows.
+                if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab && t.path == path && t.timeline_asked == asked) {
+                    tab.timeline = rows;
+                }
+            }
+            Message::TimelineLoaded { rows: None, .. } => {}
+            Message::DailyFound(daily) => return self.open_daily(daily),
             Message::ToggleTask(i) => {
                 let Some(row) = self.tasks.as_ref().and_then(|list| list.rows.get(i)) else { return Task::none() };
                 return self.write_task(tasks::task_ref(row), None);
@@ -1895,7 +2177,7 @@ impl App {
                 self.notice(format!("Task in {path} not changed: {error}"));
             }
             Message::EmbedLoaded { tab, key, embedded } => {
-                if let Some(tab) = self.tabs.iter_mut().find(|t| t.path == tab) {
+                if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab) {
                     // Only if still wanted: the embed may have been edited away.
                     if let Some(slot) = tab.embeds.get_mut(&key) {
                         *slot = embedded;
@@ -1974,7 +2256,7 @@ impl App {
             Message::TemplatesFound(Ok(config)) => return self.choose_template(config),
             Message::TemplatesFound(Err(error)) => self.notice(format!("Could not read the template settings: {error}")),
             Message::TemplateLoaded { target, config, result: Ok(template) } => {
-                return self.insert_template(&target, &template, &config);
+                return self.insert_template(target, &template, &config);
             }
             Message::TemplateLoaded { result: Err(error), .. } => self.notice(format!("Could not read the template: {error}")),
             Message::SelectTab(i) => {
@@ -1987,6 +2269,10 @@ impl App {
                 self.settings_open = false;
                 self.completion = None;
                 self.persist();
+                if self.tabs.get(i).is_some_and(|t| t.tasks) {
+                    self.tasks = Some(TaskList::default());
+                    self.load_tasks();
+                }
             }
             Message::CloseTab(i) => self.close_tab(i),
             Message::TabMenu(i) => {
@@ -2004,25 +2290,27 @@ impl App {
                 self.tab_menu = None;
                 let j = i as isize + by;
                 if i < self.tabs.len() && j >= 0 && (j as usize) < self.tabs.len() {
-                    let current = self.tabs[self.active].path.clone();
+                    let current = self.tabs.get(self.active).map(|t| t.id);
                     self.tabs.swap(i, j as usize);
-                    self.active = self.tabs.iter().position(|t| t.path == current).unwrap_or(0);
+                    self.active = self.tabs.iter().position(|t| Some(t.id) == current).unwrap_or(0);
                     self.persist();
                 }
             }
             Message::PinTab(i) => {
                 self.menu = None;
                 self.tab_menu = None;
-                if let Some(path) = self.tabs.get(i).map(|t| t.path.clone()) {
+                // Pins are kept by path: a blank tab or the task list, whose
+                // path is empty, would pin every other one with it.
+                if let Some(path) = self.tabs.get(i).map(|t| t.path.clone()).filter(|p| !p.is_empty()) {
                     if let Some(at) = self.pinned.iter().position(|p| *p == path) {
                         self.pinned.remove(at);
                     } else {
                         // Pinned tabs gather at the left.
-                        let current = self.tabs[self.active].path.clone();
+                        let current = self.tabs.get(self.active).map(|t| t.id);
                         let tab = self.tabs.remove(i);
                         let to = self.tabs.iter().take_while(|t| self.pinned.contains(&t.path)).count();
                         self.tabs.insert(to, tab);
-                        self.active = self.tabs.iter().position(|t| t.path == current).unwrap_or(0);
+                        self.active = self.tabs.iter().position(|t| Some(t.id) == current).unwrap_or(0);
                         self.pinned.push(path);
                     }
                     self.persist();
@@ -2091,6 +2379,11 @@ impl App {
                     return Task::none();
                 };
                 let is_edit = action.is_edit();
+                // A key that was on its way as a merge came up: resolving the
+                // merge replaces the text, and would drop the edit unseen.
+                if is_edit && tab.merge.is_some() {
+                    return Task::none();
+                }
                 self.prop_complete = None;
                 if is_edit {
                     let typing = matches!(
@@ -2132,9 +2425,12 @@ impl App {
             }
             Message::MenuReveal => {
                 if let Some((path, _)) = self.menu.take() {
-                    if let Err(error) = reveal(&self.vault.join(&path)) {
-                        self.notice(error);
-                    }
+                    // xdg-open and wslview can take seconds to hand over.
+                    let abs = self.vault.join(&path);
+                    return Task::perform(
+                        async move { tokio::task::spawn_blocking(move || reveal(&abs)).await.unwrap_or_else(|e| Err(e.to_string())) },
+                        Message::UrlOpened,
+                    );
                 }
             }
             Message::MenuCopyLink => {
@@ -2316,6 +2612,42 @@ impl App {
                 tab.set_property(entry, &sage_editor::properties::Value::List { items, block });
                 return iced::widget::operation::focus(iced::widget::Id::from(preview::property_id(entry, next)));
             }
+            Message::Table(start, edit) => {
+                use tables::Edit;
+                let Some(tab) = self.tabs.get_mut(self.active).filter(|t| t.loaded) else { return Task::none() };
+                match edit {
+                    Edit::Cell(r, c, s) => {
+                        self.table_draft = Some((start, r, c, s.clone()));
+                        tab.edit_table(start, true, |t| t.set(r, c, s.trim()));
+                    }
+                    Edit::Enter(r, c) => {
+                        self.table_draft = None;
+                        let below = r + 1;
+                        if tab.table_at(start).is_some_and(|t| below >= t.rows.len()) {
+                            tab.edit_table(start, false, |t| t.add_row(r));
+                        }
+                        return iced::widget::operation::focus(tables::cell_id(start, below, c));
+                    }
+                    Edit::AddRow(after) => {
+                        self.table_draft = None;
+                        tab.edit_table(start, false, |t| t.add_row(after));
+                        return iced::widget::operation::focus(tables::cell_id(start, after + 1, 0));
+                    }
+                    Edit::AddColumn(after) => {
+                        self.table_draft = None;
+                        tab.edit_table(start, false, |t| t.add_column(after));
+                        return iced::widget::operation::focus(tables::cell_id(start, 0, after + 1));
+                    }
+                    Edit::RemoveRow(r) => {
+                        self.table_draft = None;
+                        tab.edit_table(start, false, |t| t.remove_row(r));
+                    }
+                    Edit::RemoveColumn(c) => {
+                        self.table_draft = None;
+                        tab.edit_table(start, false, |t| t.remove_column(c));
+                    }
+                }
+            }
             // Keys for the suggestions under a property field, which has the focus.
             Message::Key(Shortcut::Escape) if self.prop_complete.is_some() => self.prop_complete = None,
             Message::Key(Shortcut::Escape) if self.new_property.is_some() && self.palette.is_none() => self.new_property = None,
@@ -2331,7 +2663,9 @@ impl App {
                 }
             }
             Message::Tick => {
-                let due: Vec<usize> = (0..self.tabs.len()).filter(|&i| self.tabs[i].wants_autosave()).collect();
+                // A note a rename is moving waits for it quietly; `rename_done` saves it.
+                let due: Vec<usize> =
+                    (0..self.tabs.len()).filter(|&i| self.tabs[i].wants_autosave() && !self.rename_holds(&self.tabs[i].path)).collect();
                 let mut saves: Vec<Task<Message>> = due.into_iter().map(|i| self.save(i, false)).collect();
                 if self.settings_changed.is_some_and(|at| at.elapsed() >= AUTOSAVE_AFTER) {
                     saves.push(self.save_settings());
@@ -2387,7 +2721,7 @@ impl App {
                     (Some(HitAction::Create(name)), mode) => return self.create(Some(&name), matches!(mode, PaletteMode::NewNote)),
                     (Some(HitAction::CreateFolder(folder)), _) => return self.create_folder(folder),
                     (Some(HitAction::Run(command)), _) => return self.run(command),
-                    (Some(HitAction::Rename(to)), PaletteMode::Rename(from)) => {
+                    (Some(HitAction::Rename(to)), PaletteMode::Rename(from) | PaletteMode::MoveTo(from)) => {
                         return self.rename(Move { from, to, folder: false });
                     }
                     (Some(HitAction::RenameFolder(to)), PaletteMode::RenameFolder(from)) => {
@@ -2400,6 +2734,7 @@ impl App {
                     (Some(HitAction::QuickAddRun(i)), PaletteMode::QuickAddValue(_)) => {
                         return self.run_quick_add(i, palette.query.trim().to_owned());
                     }
+                    (Some(HitAction::Flow(step)), mode) => return self.flow_step(step, mode, palette.query),
                     (Some(HitAction::Nothing), mode) => self.palette = Some(Palette { mode, ..palette }),
                     _ => {}
                 }
@@ -2460,7 +2795,8 @@ impl App {
                     }
                 }
             }
-            // `update` runs `sync_previews` after every message, which parses.
+            // `update` runs `sync_previews` after every message, which parses,
+            // counts and runs views that were waiting.
             Message::Settle => {}
             Message::Clock => {
                 // `due<today` meant yesterday until now: run views and the task
@@ -2475,6 +2811,7 @@ impl App {
                         tab.stale = true;
                     }
                 }
+                return self.check_reminders();
             }
             Message::Key(Shortcut::Tab) => return self.task_form_tab(),
             Message::TaskFormTitle(title) => {
@@ -2486,6 +2823,25 @@ impl App {
             Message::TaskFormDue(due) => {
                 if let Some(form) = &mut self.task_form {
                     form.due = due;
+                    form.error = None;
+                }
+            }
+            Message::Notified(Ok(())) => {}
+            Message::Notified(Err(error)) => {
+                self.status = error;
+                self.status_until = Instant::now() + NOTICE_FOR;
+            }
+            Message::SettingsNotifications(on) => {
+                self.settings.notifications = Some(on);
+                self.settings_edited();
+            }
+            Message::SettingsReminderTime(time) => {
+                self.settings.reminder_time = Some(time).filter(|t| !t.trim().is_empty());
+                self.settings_edited();
+            }
+            Message::TaskFormRemind(remind) => {
+                if let Some(form) = &mut self.task_form {
+                    form.remind = remind;
                     form.error = None;
                 }
             }
@@ -2546,15 +2902,41 @@ impl App {
             }
             Command::View(mode) => return self.set_view(mode),
             Command::Shortcuts => self.help = !self.help,
+            Command::CreateStarterVault => return self.create_starter(),
             Command::ToggleTheme => {
                 self.dark_override = Some(!self.dark());
                 self.persist();
             }
             Command::CloseActiveTab => self.close_tab(self.active),
+            Command::NewTab => {
+                self.palette = None;
+                self.tasks = None;
+                self.settings_open = false;
+                match self.tabs.iter().position(Tab::is_blank) {
+                    Some(i) => self.active = i,
+                    None => {
+                        self.tabs.push(Tab::blank());
+                        self.active = self.tabs.len() - 1;
+                    }
+                }
+                self.completion = None;
+                self.find = None;
+                self.persist();
+            }
+            Command::OpenNote => {
+                if self.palette.is_none() {
+                    return self.run(Command::TogglePalette);
+                }
+            }
             Command::Find => return self.open_find(),
             Command::RenameNote => {
                 if let Some(tab) = self.tabs.get(self.active).filter(|t| t.loaded) {
                     return self.start_rename(tab.path.clone());
+                }
+            }
+            Command::MoveNote => {
+                if let Some(tab) = self.tabs.get(self.active).filter(|t| t.loaded) {
+                    return self.start_move(tab.path.clone());
                 }
             }
             Command::RenameFolder => {
@@ -2570,11 +2952,17 @@ impl App {
             Command::ToggleSettings => return self.handle(Message::ToggleSettings),
             Command::OpenVault => return self.open_vault(),
             Command::NewInlineTask => return self.open_task_form(false),
-            Command::FollowUp => {
+            Command::LogToProject => return self.start_log(),
+            Command::PromoteLog => return self.promote_log(),
+            Command::Triage => return self.start_triage(),
+            Command::ImportEvent => return iced::clipboard::read().map(Message::ImportText),
+            Command::WeeklyReview => return self.weekly_review(),
+            Command::FollowUp | Command::WaitingFor => {
                 if self.settings_open || self.tasks.is_some() || self.view_mode == ViewMode::Preview {
                     return Task::none();
                 }
-                let Some(tab) = self.tabs.get_mut(self.active).filter(|t| t.loaded) else { return Task::none() };
+                // Not while a merge waits: resolving it replaces the text, and the edit with it.
+                let Some(tab) = self.tabs.get_mut(self.active).filter(|t| t.loaded && t.merge.is_none()) else { return Task::none() };
                 let line = tab.content.cursor().position.line;
                 let Some(old) = tab.content.line(line).map(|l| l.text.into_owned()) else { return Task::none() };
                 let rest = old.trim_start();
@@ -2587,19 +2975,34 @@ impl App {
                     format!("- [ ] {rest}")
                 };
                 let gap = if body.ends_with(' ') || body.ends_with("] ") { "" } else { " " };
-                let new = format!("{indent}{body}{gap}@");
+                let mark = if command == Command::WaitingFor { format!("#{} ➕ {} ", sage_editor::log::WAITING_TAG, sage_editor::today()) } else { String::new() };
+                let new = format!("{indent}{body}{gap}{mark}@");
                 tab.replace_line(line, &new);
                 tab.put_cursor(line, new.len());
                 self.refresh_completion();
             }
             Command::NewTaskNote => return self.open_task_form(true),
             Command::ToggleTasks => {
-                if self.tasks.take().is_none() {
+                if self.tasks.take().is_some() {
+                    // Toggling the list off closes the tab it was in.
+                    if self.tabs.get(self.active).is_some_and(|t| t.tasks) {
+                        self.close_tab(self.active);
+                    }
+                } else {
                     self.palette = None;
                     self.find = None;
                     self.completion = None;
+                    self.settings_open = false;
+                    match self.tabs.iter().position(|t| t.tasks) {
+                        Some(i) => self.active = i,
+                        None => {
+                            self.tabs.push(Tab::tasks());
+                            self.active = self.tabs.len() - 1;
+                        }
+                    }
                     self.tasks = Some(TaskList::default());
                     self.load_tasks();
+                    self.persist();
                 }
             }
             Command::SearchEverywhere => {
@@ -2674,6 +3077,7 @@ impl App {
                     self.reader = sage_db::open_reader(&self.db_path).ok();
                     self.reload_files();
                 }
+                self.load_reminders();
                 self.status = format!("{known_files} files cached, checking for changes");
             }
             IndexEvent::Progress { done, total } => {
@@ -2684,20 +3088,19 @@ impl App {
             IndexEvent::Changed { paths } => {
                 self.reload_files();
                 self.load_tasks();
+                self.load_reminders();
                 let mut reads = Vec::new();
                 for i in 0..self.tabs.len() {
                     self.tabs[i].links_stale = true;
                     // Re-read open notes that changed. on_loaded decides whether
                     // that is a no-op (our own save), a reload or a conflict.
                     if self.tabs[i].loaded && paths.contains(&self.tabs[i].path) {
-                        reads.push(self.read(&self.tabs[i].path));
+                        reads.push(self.read(self.tabs[i].id, &self.tabs[i].path));
                     }
-                    // Any change can alter what a view matches, and an embed
-                    // that was missing may exist now.
+                    // Any change can alter what a view matches; `sync_previews`
+                    // runs them again. An embed that was missing may exist now.
                     let tab = &mut self.tabs[i];
-                    tab.views.clear();
-                    tab.task_lists.clear();
-                    tab.docs.clear();
+                    tab.index_stale = true;
                     tab.embeds.retain(|_, embed| match embed {
                         Embedded::Loading => true,
                         Embedded::Image { path, .. } | Embedded::Svg { path, .. } | Embedded::Note { path, .. } => {
@@ -2711,6 +3114,12 @@ impl App {
                 return Task::batch(reads);
             }
             IndexEvent::Idle { files, took_ms } => {
+                // The first pass has caught up with changes made while Sage was
+                // closed, so a task finished elsewhere no longer reminds.
+                if !std::mem::replace(&mut self.indexed, true) {
+                    self.load_reminders();
+                    return self.check_reminders();
+                }
                 if !self.tabs.iter().any(|t| t.conflict) && Instant::now() >= self.status_until {
                     self.status = format!("{files} files indexed, last pass {took_ms} ms");
                 }
@@ -2727,7 +3136,8 @@ impl App {
 
     // ---- files --------------------------------------------------------------
 
-    fn read(&self, path: &str) -> Task<Message> {
+    /// Reads the note at `path` for tab `tab`.
+    fn read(&self, tab: u64, path: &str) -> Task<Message> {
         let abs = self.vault.join(path);
         let path = path.to_owned();
         Task::perform(
@@ -2736,7 +3146,7 @@ impl App {
                 // Never open a file we would corrupt on save.
                 String::from_utf8(bytes).map_err(|_| "not valid UTF-8, refusing to edit it".to_owned())
             },
-            move |result| Message::Loaded(path.clone(), result),
+            move |result| Message::Loaded { tab, path: path.clone(), result },
         )
     }
 
@@ -2765,11 +3175,19 @@ impl App {
             return iced::widget::operation::focus(EDITOR);
         }
         let title = self.title_of(&path);
-        let task = self.read(&path);
         let mut tab = Tab::placeholder(path, title);
+        let task = self.read(tab.id, &tab.path);
         tab.jump = jump;
-        self.tabs.push(tab);
-        self.active = self.tabs.len() - 1;
+        // Navigating changes the current tab instead of adding one. A tab with
+        // unsaved text, or a pinned one, is left as it is and the note opens
+        // beside it, so nothing is lost.
+        let replaces = self.tabs.get(self.active).is_some_and(|t| !t.busy() && !self.pinned.contains(&t.path));
+        if replaces {
+            self.tabs[self.active] = tab;
+        } else {
+            self.tabs.push(tab);
+            self.active = self.tabs.len() - 1;
+        }
         self.completion = None;
         self.find = None;
         self.persist();
@@ -2845,20 +3263,27 @@ impl App {
         sage_query::documents::document(self.reader.as_ref()?, &path).ok().flatten()
     }
 
-    fn on_loaded(&mut self, path: String, result: Result<String, String>) -> Task<Message> {
-        let Some(i) = self.tabs.iter().position(|t| t.path == path) else { return Task::none() };
+    fn on_loaded(&mut self, tab: u64, path: String, result: Result<String, String>) -> Task<Message> {
+        let Some(i) = self.tabs.iter().position(|t| t.id == tab) else { return Task::none() };
         let tab = &mut self.tabs[i];
+        // Read from where the note was before a rename moved it: no longer its
+        // text. A tab still waiting for its first read reads the new place.
+        if tab.path != path {
+            let (loaded, id, current) = (tab.loaded, tab.id, tab.path.clone());
+            return if loaded { Task::none() } else { self.read(id, &current) };
+        }
         match result {
             Ok(text) if !tab.loaded => {
                 tab.set_text(text);
                 if let Some(jump) = tab.jump.take() {
                     tab.jump_to(jump);
                 }
-                self.load_links(i);
+                let links = self.load_links(i);
                 // A note that was just opened is ready to type into.
                 if i == self.active && self.palette.is_none() {
-                    return iced::widget::operation::focus(EDITOR);
+                    return Task::batch([links, iced::widget::operation::focus(EDITOR)]);
                 }
+                return links;
             }
             // Our own save coming back, or a touch.
             Ok(text) if text == tab.base => {}
@@ -2867,7 +3292,8 @@ impl App {
             // Changed elsewhere: reloaded, or merged with the edits made here.
             Ok(text) => return self.merge_disk(i, text),
             Err(error) if !tab.loaded => {
-                self.active = active_after(self.active, &self.tabs, |t| t.path == path);
+                let id = tab.id;
+                self.active = active_after(self.active, &self.tabs, |t| t.id == id);
                 self.tabs.remove(i);
                 self.notice(format!("Cannot open {path}: {error}"));
                 self.persist();
@@ -2879,6 +3305,10 @@ impl App {
 
     fn save(&mut self, i: usize, force: bool) -> Task<Message> {
         let backend = self.backend.unwrap_or(Backend::Poll);
+        if self.tabs.get(i).is_some_and(|t| t.loaded && (t.dirty || force) && self.rename_holds(&t.path)) {
+            self.notice(format!("{} is being moved; it is saved once that is done", self.tabs[i].path));
+            return Task::none();
+        }
         let Some(tab) = self.tabs.get_mut(i).filter(|t| t.loaded && !t.saving) else {
             return Task::none();
         };
@@ -2886,7 +3316,7 @@ impl App {
             return Task::none();
         }
         tab.saving = true;
-        let (abs, path, seq) = (self.vault.join(&tab.path), tab.path.clone(), tab.edit_seq);
+        let (abs, path, seq, id) = (self.vault.join(&tab.path), tab.path.clone(), tab.edit_seq, tab.id);
         let (text, base) = (tab.content.text(), tab.base.clone());
         Task::perform(
             async move {
@@ -2902,15 +3332,40 @@ impl App {
                 .unwrap_or_else(|e| Err(SaveError::Io(e.to_string())))
                 .map(|()| text)
             },
-            move |result| Message::Saved { path: path.clone(), seq, result },
+            move |result| Message::Saved { tab: id, path: path.clone(), seq, result },
         )
     }
 
-    fn on_saved(&mut self, path: String, seq: u64, result: Result<String, SaveError>) -> Task<Message> {
-        let Some(tab) = self.tabs.iter_mut().find(|t| t.path == path) else { return Task::none() };
+    fn on_saved(&mut self, id: u64, path: String, seq: u64, result: Result<String, SaveError>) -> Task<Message> {
+        let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) else { return Task::none() };
         tab.saving = false;
+        let mut closing = Task::none();
         match result {
+            // Written where the note was before it moved. `rename_holds` keeps
+            // saves from starting while a move is under way, so this should not
+            // happen; if it does, the write is no save of the note where it is
+            // now: the tab stays unsaved, and the user hears of the stray file.
+            Ok(_) if tab.path != path => {
+                tab.dirty = true;
+                tab.last_edit = Instant::now();
+                let now = tab.path.clone();
+                self.notice(format!("{path} was written after the note moved to {now}; {now} is saved next, check {path}"));
+            }
             Ok(text) => {
+                let targets = sage_editor::tasks::checked_links(&tab.base, &text);
+                if !targets.is_empty() {
+                    let (db_path, vault, from) = (self.db_path.clone(), self.vault.clone(), path.clone());
+                    let backend = self.backend.unwrap_or(Backend::Poll);
+                    closing = Task::perform(
+                        async move {
+                            tokio::task::spawn_blocking(move || close_linked_notes(&db_path, &vault, &from, &targets, backend))
+                                .await
+                                .unwrap_or_default()
+                        },
+                        Message::TaskNotesClosed,
+                    );
+                }
+                let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) else { return closing };
                 tab.base = text;
                 tab.conflict = false;
                 // "Overwrite file on disk" settles a merge that was waiting.
@@ -2920,13 +3375,14 @@ impl App {
                 tab.dirty = tab.edit_seq != seq;
                 self.status = format!("Saved {path}");
                 if std::mem::take(&mut tab.reread) {
-                    return self.read(&path);
+                    return Task::batch([closing, self.read(id, &path)]);
                 }
             }
             // The file changed since the tab last read it: merge rather than refuse.
             Err(SaveError::Conflict) => {
                 tab.reread = false;
-                return self.read(&path);
+                let current = tab.path.clone();
+                return self.read(id, &current);
             }
             Err(SaveError::Io(error)) => {
                 // Back off so autosave does not retry on every tick.
@@ -2934,7 +3390,7 @@ impl App {
                 self.notice(format!("Could not save {path}: {error}"));
             }
         }
-        Task::none()
+        closing
     }
 
     /// The note changed on disk: takes the change into the tab. With no edits
@@ -2994,8 +3450,8 @@ impl App {
 
     /// Compares a OneDrive conflict copy with its note: lines both have are
     /// kept, every difference is the user's to choose.
-    fn compare_copy(&mut self, tab: &str, copy: String, text: &str) -> Task<Message> {
-        let Some(tab) = self.tabs.iter_mut().find(|t| t.path == tab && t.loaded && t.merge.is_none()) else {
+    fn compare_copy(&mut self, tab: u64, copy: String, text: &str) -> Task<Message> {
+        let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab && t.loaded && t.merge.is_none()) else {
             return Task::none();
         };
         let merge = sage_editor::merge::diff2(&tab.content.text(), text);
@@ -3010,8 +3466,8 @@ impl App {
 
     /// Stats the open notes off the UI thread; `on_polled` reads the changed ones.
     fn poll_tabs(&mut self) -> Task<Message> {
-        let files: Vec<(String, PathBuf)> =
-            self.tabs.iter().filter(|t| t.loaded).map(|t| (t.path.clone(), self.vault.join(&t.path))).collect();
+        let files: Vec<(u64, String, PathBuf)> =
+            self.tabs.iter().filter(|t| t.loaded).map(|t| (t.id, t.path.clone(), self.vault.join(&t.path))).collect();
         if self.polling || files.is_empty() {
             return Task::none();
         }
@@ -3019,7 +3475,7 @@ impl App {
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
-                    files.into_iter().map(|(path, abs)| (path, stamp(&abs))).collect::<Vec<_>>()
+                    files.into_iter().map(|(id, path, abs)| (id, path, stamp(&abs))).collect::<Vec<_>>()
                 })
                 .await
                 .unwrap_or_default()
@@ -3028,22 +3484,36 @@ impl App {
         )
     }
 
-    fn on_polled(&mut self, stamps: Vec<(String, Option<Stamp>)>) -> Task<Message> {
+    fn on_polled(&mut self, stamps: Vec<(u64, String, Option<Stamp>)>) -> Task<Message> {
         self.polling = false;
         let mut changed = Vec::new();
-        for (path, stamp) in stamps {
+        for (id, path, stamp) in stamps {
             // A note that is gone was moved or deleted; the indexer reports that.
-            let (Some(tab), Some(stamp)) = (self.tabs.iter_mut().find(|t| t.path == path), stamp) else { continue };
+            let (Some(tab), Some(stamp)) = (self.tabs.iter_mut().find(|t| t.id == id && t.path == path), stamp) else { continue };
             // The first stamp is only a reference point. Our own saves change it
             // too; their read finds the text equal to the base and stops there.
             if tab.disk_stamp.replace(stamp).is_some_and(|old| old != stamp) {
-                changed.push(path);
+                changed.push((id, path));
             }
         }
-        Task::batch(changed.iter().map(|path| self.read(path)))
+        Task::batch(changed.iter().map(|(id, path)| self.read(*id, path)))
     }
 
     /// Creates a note in the vault root (or under the folders in `name`) and opens it.
+    /// Writes the starter vault in the background; files that exist are kept.
+    fn create_starter(&mut self) -> Task<Message> {
+        self.palette = None;
+        let (vault, backend) = (self.vault.clone(), self.backend.unwrap_or(Backend::Poll));
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || sage_editor::starter::create(&vault, backend))
+                    .await
+                    .unwrap_or_else(|e| Err(e.to_string()))
+            },
+            Message::StarterCreated,
+        )
+    }
+
     fn create(&mut self, name: Option<&str>, default_template: bool) -> Task<Message> {
         self.palette = None;
         let vault = self.vault.clone();
@@ -3087,13 +3557,19 @@ impl App {
     /// vault's `.trash` folder, as Obsidian does. Refused while a note in it
     /// has unsaved edits.
     fn ask_delete(&mut self, path: String, folder: bool) {
-        let inside = |p: &str| p == path || (folder && p.strip_prefix(&path).is_some_and(|rest| rest.starts_with('/')));
-        if let Some(tab) = self.tabs.iter().find(|t| t.busy() && inside(&t.path)) {
-            self.notice(format!("Save {} before deleting it", tab.path));
+        if let Some(busy) = self.busy_inside(&path, folder) {
+            self.notice(format!("Save {busy} before deleting it"));
             return;
         }
         self.palette = None;
         self.doomed = Some(Doomed { path, folder });
+    }
+
+    /// The path of a note at `path`, or in it for a folder, whose tab has
+    /// text that is not on disk yet.
+    fn busy_inside(&self, path: &str, folder: bool) -> Option<String> {
+        let inside = |p: &str| p == path || (folder && p.strip_prefix(path).is_some_and(|rest| rest.starts_with('/')));
+        self.tabs.iter().find(|t| t.busy() && inside(&t.path)).map(|t| t.path.clone())
     }
 
     /// Moves a file or folder into the vault's `.trash` folder under a free
@@ -3189,7 +3665,23 @@ impl App {
     /// Opens today's daily note, creating it first, from the template if the
     /// Daily notes plugin names one, as Obsidian does.
     fn daily_note(&mut self) -> Task<Message> {
-        let daily = sage_editor::obsidian::Daily::load(&self.vault);
+        // Obsidian's settings are read off the UI thread, as they are now.
+        let vault = self.vault.clone();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || sage_editor::obsidian::Daily::load(&vault))
+                    .await
+                    .map_err(|e| e.to_string())
+            },
+            |result| match result {
+                Ok(daily) => Message::DailyFound(daily),
+                Err(error) => Message::QuickNoteDone { result: Err(error), open: true },
+            },
+        )
+    }
+
+    /// Opens today's note as the Daily notes settings `daily` name it.
+    fn open_daily(&mut self, daily: sage_editor::obsidian::Daily) -> Task<Message> {
         let now = sage_editor::now();
         let rel = daily.path(now);
         if self.files.iter().any(|f| f.path == rel) {
@@ -3212,7 +3704,7 @@ impl App {
     /// Runs an editing command on the active note. Keys with nothing special
     /// to do there do what they always do.
     fn edit_op(&mut self, op: EditOp) -> Task<Message> {
-        let Some(tab) = self.tabs.get_mut(self.active).filter(|t| t.loaded) else {
+        let Some(tab) = self.tabs.get_mut(self.active).filter(|t| t.loaded && t.merge.is_none()) else {
             return Task::none();
         };
         if matches!(op, EditOp::Undo | EditOp::Redo) {
@@ -3224,20 +3716,21 @@ impl App {
             self.refresh_find(false);
             return Task::none();
         }
-        let lines = tab.lines();
         let (anchor, head) = tab.selection();
         let unit = self.indent_unit.as_str();
-        let change = match op {
-            EditOp::Format(format) => Some(edit::toggle(&lines, anchor, head, format)),
-            EditOp::Link => Some(edit::link(&lines, anchor, head)),
-            EditOp::Enter => edit::enter(&lines, head, unit).filter(|_| anchor == head),
-            EditOp::Indent(out) => edit::indent(&lines, anchor, head, out, unit),
-            EditOp::MoveLines(up) => edit::move_lines(&lines, anchor, head, up),
-            EditOp::Duplicate => Some(edit::duplicate(&lines, anchor, head)),
-            EditOp::Type(c) => edit::type_char(&lines, anchor, head, c),
-            EditOp::Backspace => edit::backspace(&lines, head).filter(|_| anchor == head),
+        let content = &tab.content;
+        let line = |i: usize| content.line(i).map(|l| l.text.into_owned()).unwrap_or_default();
+        let change = windowed(content.line_count(), line, anchor, head, |lines, anchor, head| match op {
+            EditOp::Format(format) => Some(edit::toggle(lines, anchor, head, format)),
+            EditOp::Link => Some(edit::link(lines, anchor, head)),
+            EditOp::Enter => edit::enter(lines, head, unit).filter(|_| anchor == head),
+            EditOp::Indent(out) => edit::indent(lines, anchor, head, out, unit),
+            EditOp::MoveLines(up) => edit::move_lines(lines, anchor, head, up),
+            EditOp::Duplicate => Some(edit::duplicate(lines, anchor, head)),
+            EditOp::Type(c) => edit::type_char(lines, anchor, head, c),
+            EditOp::Backspace => edit::backspace(lines, head).filter(|_| anchor == head),
             EditOp::Undo | EditOp::Redo => None,
-        };
+        });
         let Some(change) = change else {
             let fallback = match op {
                 EditOp::Enter => Edit::Enter,
@@ -3257,7 +3750,7 @@ impl App {
     /// the active note and embeds it there.
     fn paste_image(&mut self) -> Task<Message> {
         let Some(tab) = self.tabs.get(self.active).filter(|t| t.loaded) else { return Task::none() };
-        let (vault, note, tab) = (self.vault.clone(), tab.path.clone(), tab.path.clone());
+        let (vault, note, tab) = (self.vault.clone(), tab.path.clone(), tab.id);
         let name = sage_editor::obsidian::pasted_name(sage_editor::now());
         Task::perform(
             async move {
@@ -3269,7 +3762,7 @@ impl App {
                 .await
                 .unwrap_or_else(|e| Err(e.to_string()))
             },
-            move |result| Message::Attached { tab: tab.clone(), result },
+            move |result| Message::Attached { tab, result },
         )
     }
 
@@ -3287,7 +3780,7 @@ impl App {
             self.notice(format!("Only pictures can be dropped into a note, not {name}"));
             return Task::none();
         }
-        let (vault, note, tab) = (self.vault.clone(), tab.path.clone(), tab.path.clone());
+        let (vault, note, tab) = (self.vault.clone(), tab.path.clone(), tab.id);
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
@@ -3298,13 +3791,13 @@ impl App {
                 .await
                 .unwrap_or_else(|e| Err(e.to_string()))
             },
-            move |result| Message::Attached { tab: tab.clone(), result },
+            move |result| Message::Attached { tab, result },
         )
     }
 
     /// Embeds a picture just saved into the vault at the cursor of the note
     /// it was saved for.
-    fn on_attached(&mut self, tab: String, result: Result<Option<String>, String>) -> Task<Message> {
+    fn on_attached(&mut self, tab: u64, result: Result<Option<String>, String>) -> Task<Message> {
         let path = match result {
             Ok(Some(path)) => path,
             Ok(None) => return Task::none(),
@@ -3313,13 +3806,13 @@ impl App {
                 return Task::none();
             }
         };
-        let Some(i) = self.tabs.iter().position(|t| t.path == tab && t.loaded) else {
+        let Some(i) = self.tabs.iter().position(|t| t.id == tab && t.loaded) else {
             self.notice(format!("Saved {path}"));
             return Task::none();
         };
         // Resolving the merge replaces the text, and the link with it.
         if self.tabs[i].merge.is_some() {
-            self.notice(format!("Saved {path}; not linked while {tab} has changes to resolve"));
+            self.notice(format!("Saved {path}; not linked while {} has changes to resolve", self.tabs[i].path));
             return Task::none();
         }
         // The name alone, as Obsidian writes it, unless another file has it.
@@ -3342,20 +3835,24 @@ impl App {
         if !kept.is_empty() {
             self.notice(format!("{} tab(s) with unsaved changes stay open", kept.len()));
         }
-        let paths: Vec<String> = gone.iter().map(|&i| self.tabs[i].path.clone()).collect();
-        let current = self.tabs.get(self.active).map(|t| t.path.clone());
-        self.active = active_after(self.active, &self.tabs, |t| paths.contains(&t.path));
+        // By id: blank tabs all share the empty path.
+        let ids: Vec<u64> = gone.iter().map(|&i| self.tabs[i].id).collect();
+        let current = self.tabs.get(self.active).map(|t| t.id);
+        self.active = active_after(self.active, &self.tabs, |t| ids.contains(&t.id));
         let mut closed = Vec::new();
         self.tabs.retain(|t| {
-            let drop = paths.contains(&t.path);
-            if drop {
+            let drop = ids.contains(&t.id);
+            if drop && !t.path.is_empty() {
                 closed.push(t.path.clone());
             }
             !drop
         });
         self.closed.extend(closed);
+        if !self.tabs.iter().any(|t| t.tasks) {
+            self.tasks = None;
+        }
         // The current note stays current when it is not one that closed.
-        if let Some(i) = current.and_then(|c| self.tabs.iter().position(|t| t.path == c)) {
+        if let Some(i) = current.and_then(|c| self.tabs.iter().position(|t| t.id == c)) {
             self.active = i;
         }
         self.completion = None;
@@ -3372,10 +3869,15 @@ impl App {
             self.notice(format!("{} has unsaved changes. Save first (Ctrl+S)", tab.path));
             return;
         }
-        let paths: Vec<&str> = self.tabs.iter().map(|t| t.path.as_str()).collect();
-        self.active = active_after(self.active, &paths, |p| *p == tab.path);
+        let id = tab.id;
+        self.active = active_after(self.active, &self.tabs, |t| t.id == id);
         let closed = self.tabs.remove(i);
-        self.closed.push(closed.path);
+        if !closed.path.is_empty() {
+            self.closed.push(closed.path);
+        }
+        if closed.tasks {
+            self.tasks = None;
+        }
         self.completion = None;
         self.find = None;
         self.persist();
@@ -3396,7 +3898,8 @@ impl App {
         // An autosave that was already under way: wait for it rather than cut
         // it off, since a note on OneDrive is rewritten in place. A second
         // close does not wait for a save that hangs, on a lost network drive.
-        if !force && self.tabs.iter().any(|t| t.saving) {
+        // A rename under way holds saves back, and starts them when it is done.
+        if !force && (self.renaming.is_some() || self.tabs.iter().any(|t| t.saving)) {
             return Task::perform(
                 async { tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(100))).await },
                 move |_| Message::Quit { force },
@@ -3471,6 +3974,7 @@ impl App {
             pinned: self.pinned.clone(),
             outline: self.outline_open,
             zoom: Some(self.zoom),
+            reminders_checked: self.reminders_checked.map(|t| t.format(CHECKED_FORMAT).to_string()),
         };
         serde_json::to_string_pretty(&session).ok()
     }
@@ -3505,7 +4009,13 @@ impl App {
                 .unwrap_or_default();
             live::set_known(rows.iter().map(|f| f.path.clone()), aliases);
             self.files = rows;
+            self.refresh_folders();
         }
+    }
+
+    /// Makes the folder lists again, after `files` or `disk_folders` changed.
+    fn refresh_folders(&mut self) {
+        (self.note_folders, self.tree_folders) = folder_lists(&self.files, &self.disk_folders);
     }
 
     /// Brings changed previews up to date: runs view blocks that have no result
@@ -3521,7 +4031,22 @@ impl App {
         self.settling = self.tabs.get_mut(self.active).is_some_and(|tab| tab.catch_up(preview, live, outline_open));
         if self.tabs.get(self.active).is_some_and(|t| t.links_stale) {
             self.tabs[self.active].links_stale = false;
-            self.load_links(self.active);
+            loads.push(self.load_links(self.active));
+        }
+        // The index changed: views, task lists and the documents links name
+        // run again, though not on every change of a burst. Until then the
+        // old results show; the Settle tick comes back for the rest.
+        if let Some(tab) = self.tabs.get_mut(self.active).filter(|t| t.index_stale) {
+            if self.previews_run.elapsed() >= PREVIEWS_EVERY {
+                self.previews_run = Instant::now();
+                tab.index_stale = false;
+                tab.views.clear();
+                tab.task_lists.clear();
+                tab.docs.clear();
+                tab.stale = true;
+            } else {
+                self.settling = true;
+            }
         }
         let i = self.active;
         if self.tabs.get(i).is_some_and(|t| t.stale) {
@@ -3573,13 +4098,13 @@ impl App {
             }
             self.tabs[i].docs.retain(|key, _| keys.contains(key));
 
-            let tab_path = self.tabs[i].path.clone();
+            let tab_id = self.tabs[i].id;
             let mut wanted = HashSet::new();
             for (src, embed) in &embeds {
                 let key = preview::embed_key(src, embed);
                 if !self.tabs[i].embeds.contains_key(&key) {
                     self.tabs[i].embeds.insert(key.clone(), Embedded::Loading);
-                    loads.push(self.load_embed(&tab_path, src, key.clone(), embed));
+                    loads.push(self.load_embed(tab_id, src, key.clone(), embed));
                 }
                 wanted.insert(key);
             }
@@ -3606,10 +4131,9 @@ impl App {
     /// Loads an embed written in the note at `src` off the UI thread: a
     /// picture's bytes, or a note's text, cut down to the section asked for
     /// and parsed.
-    fn load_embed(&self, tab: &str, src: &str, key: String, embed: &sage_markdown::Embed) -> Task<Message> {
+    fn load_embed(&self, tab: u64, src: &str, key: String, embed: &sage_markdown::Embed) -> Task<Message> {
         let found = if embed.external { None } else { self.resolve(&sage_core::target_key(&embed.target, src)) };
-        let tab = tab.to_owned();
-        let done = move |embedded| Message::EmbedLoaded { tab: tab.clone(), key: key.clone(), embedded };
+        let done = move |embedded| Message::EmbedLoaded { tab, key: key.clone(), embedded };
         let Some(path) = found else {
             let why = if embed.external { "pictures from the web are not loaded" } else { "not in the vault" };
             return Task::done(done(Embedded::Missing(why.into())));
@@ -3635,9 +4159,25 @@ impl App {
                 },
             )
         } else if is_picture(&path) {
-            Task::perform(async move { tokio::fs::read(&abs).await.map_err(|e| e.to_string()) }, move |result| {
+            // Decoded here rather than by iced as it draws, which would stall
+            // a frame on a large photo. What does not decode is left to iced.
+            let read = async move {
+                tokio::task::spawn_blocking(move || {
+                    let bytes = std::fs::read(&abs).map_err(|e| e.to_string())?;
+                    Ok(match image::load_from_memory(&bytes) {
+                        Ok(decoded) => {
+                            let rgba = decoded.to_rgba8();
+                            iced::widget::image::Handle::from_rgba(rgba.width(), rgba.height(), rgba.into_raw())
+                        }
+                        Err(_) => iced::widget::image::Handle::from_bytes(bytes),
+                    })
+                })
+                .await
+                .unwrap_or_else(|e| Err(e.to_string()))
+            };
+            Task::perform(read, move |result| {
                 done(match result {
-                    Ok(bytes) => Embedded::Image { path: path.clone(), handle: iced::widget::image::Handle::from_bytes(bytes) },
+                    Ok(handle) => Embedded::Image { path: path.clone(), handle },
                     Err(why) => Embedded::Missing(why),
                 })
             })
@@ -3655,14 +4195,15 @@ impl App {
     }
 
     /// Backlinks, outgoing links and OneDrive conflict copies of a tab, as of
-    /// the last index pass.
-    fn load_links(&mut self, i: usize) {
+    /// the last index pass. The timeline reads the text of every note that
+    /// links to this one, so it is read off the UI thread, by the task returned.
+    fn load_links(&mut self, i: usize) -> Task<Message> {
         if self.onedrive {
             if let Some(path) = self.tabs.get(i).map(|t| t.path.clone()) {
                 self.tabs[i].copies = conflict_copies(&self.files, &path);
             }
         }
-        let (Some(reader), Some(tab)) = (&self.reader, self.tabs.get_mut(i)) else { return };
+        let (Some(reader), Some(tab)) = (&self.reader, self.tabs.get_mut(i)) else { return Task::none() };
         let rows = reader
             .prepare_cached(
                 "SELECT DISTINCT b.src_path, b.src_title
@@ -3680,6 +4221,23 @@ impl App {
         if let Ok(rows) = tasks::followups(reader, &tab.path) {
             tab.followups = rows;
         }
+        tab.timeline_asked = unique();
+        let (id, path, asked, db_path) = (tab.id, tab.path.clone(), tab.timeline_asked, self.db_path.clone());
+        let timeline = Task::perform(
+            async move {
+                let note = path.clone();
+                let rows = tokio::task::spawn_blocking(move || {
+                    // A connection of its own: the UI's reader stays on the UI thread.
+                    let db = sage_db::open_reader(&db_path).ok()?;
+                    timeline::load(&db, &note).ok()
+                })
+                .await
+                .ok()
+                .flatten();
+                (path, rows)
+            },
+            move |(path, rows)| Message::TimelineLoaded { tab: id, path, asked, rows },
+        );
 
         let rows = reader
             .prepare_cached(
@@ -3706,6 +4264,7 @@ impl App {
                 })
                 .collect();
         }
+        timeline
     }
 
     // ---- rename -------------------------------------------------------------
@@ -3723,6 +4282,14 @@ impl App {
             .chain(iced::widget::operation::select_range(PALETTE_INPUT, start, end))
     }
 
+    /// Opens the palette on the folders the note at `from` can move to.
+    fn start_move(&mut self, from: String) -> Task<Message> {
+        self.completion = None;
+        self.palette = Some(Palette { mode: PaletteMode::MoveTo(from), ..Palette::default() });
+        self.search();
+        iced::widget::operation::focus(PALETTE_INPUT)
+    }
+
     /// Opens the palette on a folder's path, with its name selected.
     fn start_folder_rename(&mut self, folder: String) -> Task<Message> {
         let name_start = folder.rfind('/').map_or(0, |i| i + 1);
@@ -3735,6 +4302,10 @@ impl App {
     }
 
     fn rename(&mut self, request: Move) -> Task<Message> {
+        if self.renaming.is_some() {
+            self.notice("A rename is under way; try again once it is done".into());
+            return Task::none();
+        }
         if let Some(tab) = self.tabs.iter().find(|t| t.busy() && moves(&request, &t.path)) {
             self.notice(format!("Save {} before renaming it", tab.path));
             return Task::none();
@@ -3758,9 +4329,16 @@ impl App {
             self.notice(format!("Save {path} before renaming it"));
             return Task::none();
         }
+        if self.renaming.is_some() {
+            self.notice("A rename is under way; try again once it is done".into());
+            return Task::none();
+        }
         let (vault, db_path) = (self.vault.clone(), self.db_path.clone());
         let backend = self.backend.unwrap_or(Backend::Poll);
         self.status = format!("Renaming {}…", request.from);
+        // From here until `Renamed` comes back, the notes it moves are not
+        // saved: typing goes on, and autosave would write the old path.
+        self.renaming = Some(request.clone());
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
@@ -3804,8 +4382,25 @@ impl App {
             ),
         });
         self.renames.push(rename);
+        if self.renames.len() > RENAMES {
+            self.renames.remove(0);
+        }
         self.reload_files();
         self.persist();
+    }
+
+    /// Whether the note at `path` must not be saved now: a rename under way
+    /// moves it, and a save would write where it is being moved away from.
+    fn rename_holds(&self, path: &str) -> bool {
+        self.renaming.as_ref().is_some_and(|request| moves(request, path))
+    }
+
+    /// A rename, or its undoing, came back, done or not: notes it held back
+    /// are saved now, under whatever path they have after it.
+    fn rename_done(&mut self) -> Task<Message> {
+        self.renaming = None;
+        let held: Vec<usize> = (0..self.tabs.len()).filter(|&i| self.tabs[i].dirty && !self.tabs[i].conflict).collect();
+        Task::batch(held.into_iter().map(|i| self.save(i, false)))
     }
 
     /// Keeps the tree as it was across a rename: a moved folder stays open,
@@ -3841,8 +4436,14 @@ impl App {
             self.notice(format!("Save {} before undoing the rename", tab.path));
             return Task::none();
         }
+        if self.renaming.is_some() {
+            self.notice("A rename is under way; try again once it is done".into());
+            return Task::none();
+        }
         let vault = self.vault.clone();
         let backend = self.backend.unwrap_or(Backend::Poll);
+        // Moving back holds saves back as a rename does.
+        self.renaming = Some(Move { from: rename.to.clone(), to: rename.from.clone(), folder: rename.folder });
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
@@ -3890,10 +4491,74 @@ impl App {
     fn notice(&mut self, message: String) {
         self.status = message.clone();
         self.status_until = Instant::now() + NOTICE_FOR;
-        self.toast = Some(Toast { text: message, undo: None, until: Instant::now() + TOAST_FOR });
+        self.toast = Some(Toast { text: message, undo: None, open: None, until: Instant::now() + TOAST_FOR });
     }
 
     // ---- tasks --------------------------------------------------------------
+
+    /// Reads the open tasks with reminders; short read-only SQL.
+    fn load_reminders(&mut self) {
+        let Some(reader) = &self.reader else { return };
+        match sage_editor::reminders::load(reader) {
+            Ok(list) => self.reminders = list,
+            Err(error) => self.notice(format!("Reminders were not read: {error}")),
+        }
+    }
+
+    /// Tells the reminders that went off since the last look: in Sage's
+    /// toast, and as a system notification unless the settings turn those
+    /// off. The first look after start gathers the ones missed while Sage was
+    /// closed into one. Nothing is told before the first index pass, nor on
+    /// the very first run, which only starts the clock.
+    fn check_reminders(&mut self) -> Task<Message> {
+        use sage_editor::reminders;
+        if !self.indexed {
+            return Task::none();
+        }
+        let now = sage_editor::now();
+        let missed = !std::mem::replace(&mut self.reminders_caught_up, true);
+        let after = match self.reminders_checked {
+            // A clock set back keeps the later mark, so nothing is told twice.
+            Some(after) if after >= now => return Task::none(),
+            Some(after) => after,
+            None => {
+                self.reminders_checked = Some(now);
+                self.persist();
+                return Task::none();
+            }
+        };
+        self.reminders_checked = Some(now);
+        let default = self.settings.reminder_time.as_deref().and_then(reminders::parse_time);
+        let default = default.unwrap_or_else(|| reminders::parse_time(reminders::DEFAULT_TIME).expect("a valid time"));
+        let hits = reminders::between(&self.reminders, after, now, default);
+        let Some(first) = hits.first() else { return Task::none() };
+        let (title, body) = match hits.len() {
+            1 if missed => ("Missed reminder".to_owned(), first.text.clone()),
+            1 => ("Reminder".to_owned(), first.text.clone()),
+            n => {
+                let title = if missed { format!("{n} reminders while Sage was closed") } else { format!("{n} reminders") };
+                let mut body: Vec<&str> = hits.iter().take(3).map(|r| r.text.as_str()).collect();
+                let more = (n > 3).then(|| format!("and {} more", n - 3));
+                body.extend(more.as_deref());
+                (title, body.join("; "))
+            }
+        };
+        let open = (hits.len() == 1).then(|| (first.path.clone(), first.line));
+        self.status = format!("{title}: {body}");
+        self.status_until = Instant::now() + NOTICE_FOR;
+        self.toast = Some(Toast { text: format!("{title}: {body}"), undo: None, open, until: Instant::now() + REMINDER_TOAST_FOR });
+        // Marked as told before Sage might close, so the next start does not tell it again.
+        self.persist();
+        if self.settings.notifications == Some(false) {
+            return Task::none();
+        }
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || notify::show(&title, &body)).await.unwrap_or_else(|e| Err(e.to_string()))
+            },
+            Message::Notified,
+        )
+    }
 
     fn load_tasks(&mut self) {
         let (Some(list), Some(reader)) = (&mut self.tasks, &self.reader) else { return };
@@ -3913,6 +4578,7 @@ impl App {
             return Task::none();
         }
         let (abs, db_path) = (self.vault.join(&task.path), self.db_path.clone());
+        let vault = self.vault.clone();
         let backend = self.backend.unwrap_or(Backend::Poll);
         let TaskRef { path, line, raw, document } = task;
         // A task document gets a status instead of a line edit.
@@ -3938,7 +4604,7 @@ impl App {
                         let expected = Some(raw.as_str()).filter(|s| !s.is_empty());
                         return sage_editor::tasks::set_status(&abs, expected, &status, base, backend);
                     }
-                    match column {
+                    let result = match &column {
                         None => sage_editor::tasks::toggle(&abs, line, &raw, base, &today, backend),
                         Some((slug, done)) => sage_editor::tasks::set_column(
                             &abs,
@@ -3946,11 +4612,23 @@ impl App {
                             &raw,
                             base,
                             slug.as_deref(),
-                            done,
+                            *done,
                             &today,
                             backend,
                         ),
+                    };
+                    // Checking a checkbox that links a task note closes the note.
+                    if result.is_ok() {
+                        let after = match &column {
+                            None => sage_editor::tasks::toggled(&raw, &today),
+                            Some((slug, done)) => sage_editor::tasks::moved(&raw, slug.as_deref(), *done, &today),
+                        };
+                        if let Some(after) = after.as_ref().and_then(|lines| lines.last()) {
+                            let targets = sage_editor::tasks::checked_links(&raw, after);
+                            close_linked_notes(&db_path, &vault, &rel, &targets, backend);
+                        }
                     }
+                    result
                 })
                 .await
                 .unwrap_or_else(|e| Err(e.to_string()))
@@ -4076,21 +4754,21 @@ impl App {
 
     fn read_template(&mut self, template: String, config: TemplateConfig) -> Task<Message> {
         let Some(tab) = self.tabs.get(self.active).filter(|t| t.loaded) else { return Task::none() };
-        let target = tab.path.clone();
+        let target = tab.id;
         let abs = self.vault.join(&template);
         Task::perform(
             async move { tokio::fs::read_to_string(&abs).await.map_err(|e| e.to_string()) },
-            move |result| Message::TemplateLoaded { target: target.clone(), config: config.clone(), result },
+            move |result| Message::TemplateLoaded { target, config: config.clone(), result },
         )
     }
 
     /// Inserts a template at the cursor of the note it was chosen for. Its
     /// properties go into the note's frontmatter instead, merged with those
     /// already there.
-    fn insert_template(&mut self, target: &str, template: &str, config: &TemplateConfig) -> Task<Message> {
-        let Some(i) = self.tabs.iter().position(|t| t.path == target && t.loaded) else { return Task::none() };
+    fn insert_template(&mut self, target: u64, template: &str, config: &TemplateConfig) -> Task<Message> {
+        let Some(i) = self.tabs.iter().position(|t| t.id == target && t.loaded) else { return Task::none() };
         if self.tabs[i].merge.is_some() {
-            self.notice(format!("Resolve the changes to {target} before inserting a template"));
+            self.notice(format!("Resolve the changes to {} before inserting a template", self.tabs[i].path));
             return Task::none();
         }
         let tab = &mut self.tabs[i];
@@ -4375,18 +5053,14 @@ impl App {
         vec![hit]
     }
 
-    /// Every folder in the vault that holds notes, with the folders above them.
-    /// Every folder the tree shows: those with notes and the empty ones on disk.
-    fn all_folders(&self) -> Vec<String> {
-        let mut folders = self.folders();
-        folders.extend(self.disk_folders.iter().cloned());
-        folders.sort_by_key(|f| f.to_lowercase());
-        folders.dedup();
-        folders
-    }
-
-    /// Lists the folders on disk off the UI thread.
-    fn scan_folders(&self) -> Task<Message> {
+    /// Lists the folders on disk off the UI thread. Every change in the index
+    /// asks for it: while one listing is under way, another follows it rather
+    /// than running beside it, where the older could come back last.
+    fn scan_folders(&mut self) -> Task<Message> {
+        if std::mem::replace(&mut self.scanning, true) {
+            self.rescan = true;
+            return Task::none();
+        }
         let vault = self.vault.clone();
         Task::perform(
             async move { tokio::task::spawn_blocking(move || tree::disk_folders(&vault)).await.unwrap_or_default() },
@@ -4406,18 +5080,6 @@ impl App {
             },
             Message::FolderCreated,
         )
-    }
-
-    fn folders(&self) -> Vec<String> {
-        let mut folders: Vec<String> = self
-            .files
-            .iter()
-            .filter(|f| !f.folder.is_empty())
-            .flat_map(|f| tree::ancestors(&format!("{}/", f.folder)).map(str::to_owned).collect::<Vec<_>>())
-            .collect();
-        folders.sort_by_key(|f| f.to_lowercase());
-        folders.dedup();
-        folders
     }
 
     // ---- find ---------------------------------------------------------------
@@ -4713,14 +5375,21 @@ impl App {
             }
             return;
         }
+        if let Some(hits) = self.flow_hits() {
+            if let Some(palette) = &mut self.palette {
+                palette.hits = hits;
+            }
+            return;
+        }
         if let Some(Palette { mode: PaletteMode::NewFolder, query, .. }) = &self.palette {
-            let hits = new_folder_hits(query, &self.all_folders());
+            let hits = new_folder_hits(query, &self.tree_folders);
             if let Some(palette) = &mut self.palette {
                 palette.hits = hits;
             }
             return;
         }
         let entries = self.quick_entries();
+        let folders = if matches!(self.palette, Some(Palette { mode: PaletteMode::MoveTo(_), .. })) { self.tree_folders.clone() } else { Vec::new() };
         let Some(palette) = &mut self.palette else { return };
         palette.hits.clear();
         match &palette.mode {
@@ -4733,11 +5402,23 @@ impl App {
                     .filter(|(_, entry)| entry.name().to_lowercase().contains(&filter))
                     .map(|(i, entry)| Hit { label: entry.name().to_owned(), detail: describe(entry), action: HitAction::QuickAdd(i) })
                     .collect();
+                if filter.is_empty() || "log to project".contains(&filter) {
+                    palette.hits.push(Hit {
+                        label: "Log to project…".into(),
+                        detail: "a dated line in a project's log".into(),
+                        action: HitAction::Run(Command::LogToProject),
+                    });
+                }
                 return;
             }
             PaletteMode::QuickAddValue(_) => return,
+            PaletteMode::Project(_) | PaletteMode::LogEntry { .. } | PaletteMode::Triage(_) | PaletteMode::TriageAction(_) | PaletteMode::Person(..) => return,
             PaletteMode::Rename(from) => {
                 palette.hits = rename_hits(from, &palette.query, &self.files, self.reader.as_ref());
+                return;
+            }
+            PaletteMode::MoveTo(from) => {
+                palette.hits = move_hits(from, &palette.query, &folders, &self.files);
                 return;
             }
             PaletteMode::RenameFolder(from) => {
@@ -4843,7 +5524,7 @@ impl App {
         if query.chars().count() >= 3 {
             palette.hits.extend(command_hits(&query.to_lowercase(), &self.settings, &entries, can_undo));
         }
-        if let Some(fts) = sage_db::fts_query(&query) {
+        if let Some(fts) = palette_fts(&query) {
             push(
                 &mut palette.hits,
                 "SELECT f.path, f.title, snippet(fts, 1, '', '', ' … ', 10)
@@ -5002,7 +5683,8 @@ impl App {
             container(tree::toolbar(
                 self.tree_order,
                 self.tree_order_menu,
-                self.all_folders().iter().any(|f| self.expanded.contains(f)),
+                // A lookup per folder, nothing made: this runs on every frame.
+                self.tree_folders.iter().any(|f| self.expanded.contains(f)),
                 t
             ))
             .padding(iced::Padding { bottom: 6.0, ..iced::Padding::ZERO }),
@@ -5057,7 +5739,7 @@ impl App {
                 settings: &self.settings,
                 current_note: self.tabs.get(self.active).map(|t| t.path.as_str()),
                 obsidian_folder: &self.obsidian_templates.folder,
-                folders: self.folders(),
+                folders: self.note_folders.clone(),
                 templates: template_hits(&self.template_config(), "", &self.files)
                     .into_iter()
                     .filter_map(|hit| match hit.action {
@@ -5102,26 +5784,66 @@ impl App {
                         .on_press(Message::Open(path.clone())),
                 );
             }
-            return container(
-                column![
-                    text("No note open").size(26).font(theme::SERIF).color(t.text),
-                    row![
-                        action("New note", Message::Run(Command::NewNote)),
-                        action("Quick add", Message::Run(Command::QuickAdd)),
-                        action("Today's note", Message::Run(Command::DailyNote)),
-                        action("Search", Message::Run(Command::SearchEverywhere)),
-                    ]
-                    .spacing(8),
-                    text("Recent").size(12).font(theme::SANS_BOLD).color(t.text_2),
-                    recent,
-                    text("Ctrl+P finds or creates a note · F1 lists every shortcut").size(13).color(t.text_2),
+            let mut start = column![
+                text("No note open").size(26).font(theme::SERIF).color(t.text),
+                row![
+                    action("New note", Message::Run(Command::NewNote)),
+                    action("Quick add", Message::Run(Command::QuickAdd)),
+                    action("Today's note", Message::Run(Command::DailyNote)),
+                    action("Search", Message::Run(Command::SearchEverywhere)),
                 ]
-                .spacing(12)
-                .align_x(iced::Center),
+                .spacing(8),
+            ]
+            .spacing(12)
+            .align_x(iced::Center);
+            // A vault without notes is offered the starter vault, once indexing shows it is empty.
+            if self.indexed && self.files.is_empty() {
+                start = start.push(
+                    column![
+                        text("This vault has no notes yet").size(12).font(theme::SANS_BOLD).color(t.text_2),
+                        action("Create starter vault", Message::Run(Command::CreateStarterVault)),
+                        text("Folders, templates with Quick Add shortcuts, and the Sage tutorial").size(13).color(t.text_2),
+                    ]
+                    .spacing(6)
+                    .align_x(iced::Center),
+                );
+            }
+            return container(
+                start
+                    .push(text("Recent").size(12).font(theme::SANS_BOLD).color(t.text_2))
+                    .push(recent)
+                    .push(text("Ctrl+P finds or creates a note · F1 lists every shortcut").size(13).color(t.text_2)),
             )
             .center(Fill)
             .into();
         };
+        if tab.path.is_empty() {
+            let action = |label: &'static str, message: Message| {
+                button(text(label).size(15))
+                    .padding([10, 22])
+                    .style(move |_, status| theme::nav_button(t, false, status))
+                    .on_press(message)
+            };
+            return column![
+                self.tab_bar(t),
+                hline(t),
+                container(
+                    column![
+                        text("New tab").size(26).font(theme::SERIF).color(t.text),
+                        row![
+                            action("New note  Ctrl+N", Message::Run(Command::NewNote)),
+                            action("Open file  Ctrl+O", Message::Run(Command::OpenNote)),
+                        ]
+                        .spacing(12),
+                    ]
+                    .spacing(16)
+                    .align_x(iced::Center),
+                )
+                .center(Fill)
+            ]
+            .width(Fill)
+            .into();
+        }
         if !tab.loaded {
             return column![
                 self.tab_bar(t),
@@ -5207,6 +5929,8 @@ impl App {
                         let editing = self.editing_prop.as_ref().filter(|(p, _)| *p == tab.path).map(|(_, e)| *e);
                         let template = tab.path.starts_with(&format!("{}/", self.template_config().folder));
                         preview::property_editor(types, popup, self.type_menu, self.chip_hover, editing, template, self.new_property.as_ref().map(|(ty, s)| (*ty, s.as_str())), t)
+                    } else if let (Some(sage_markdown::Block::Table { .. }), Some(table)) = (i.blocks.first(), tab.table_at(i.lines.start)) {
+                        tables::editor(i.lines.start, &table, self.table_draft.as_ref(), t)
                     } else {
                         preview::blocks(&i.blocks, ctx)
                     };
@@ -5214,11 +5938,13 @@ impl App {
                 })
                 .collect();
             let popup = self.completion.as_ref().map(|c| self.completion_popup(t, c));
+            let mut editable: Vec<std::ops::Range<usize>> = props.into_iter().collect();
+            editable.extend(tab.islands.iter().filter(|i| matches!(i.blocks.first(), Some(sage_markdown::Block::Table { .. }))).map(|i| i.lines.clone()));
             self.with_overlay(
                 t,
-                live_editor::LiveEditor::new(&tab.content, EDITOR, t, self.find_mark(), Message::Live, key_binding)
+                live_editor::LiveEditor::new(&tab.content, tab.revision, EDITOR, t, self.find_mark(), Message::Live, key_binding)
                     .islands(islands)
-                    .editable(props)
+                    .editable(editable)
                     .popup(popup)
                     .into(),
                 true,
@@ -5241,10 +5967,17 @@ impl App {
             }
         };
 
-        let panes: Element<'_, Message> = if tab.followups.is_empty() {
+        let panes: Element<'_, Message> = if tab.followups.is_empty() && tab.timeline.is_empty() {
             panes
         } else {
-            column![container(panes).height(Fill), hline(t), tasks::followup_panel(&tab.followups, t)].into()
+            let mut stacked = column![container(panes).height(Fill)];
+            if !tab.timeline.is_empty() {
+                stacked = stacked.push(hline(t)).push(timeline::panel(&tab.timeline, self.timeline_kind, &self.day, t));
+            }
+            if !tab.followups.is_empty() {
+                stacked = stacked.push(hline(t)).push(tasks::followup_panel(&tab.followups, t));
+            }
+            stacked.into()
         };
 
         // A OneDrive conflict copy waits above the note until it is merged.
@@ -5501,7 +6234,7 @@ impl App {
         let mut bar = Row::new().height(38);
         for (i, tab) in self.tabs.iter().enumerate() {
             // While the task list is showing, no tab is current.
-            let active = i == self.active && self.tasks.is_none();
+            let active = i == self.active && (self.tasks.is_none() || tab.tasks);
             let (label, color) = if tab.conflict {
                 (format!("{} !", tab.title), t.error)
             } else {
@@ -5531,6 +6264,16 @@ impl App {
             );
             bar = bar.push(vline(t));
         }
+        bar = bar.push(
+            container(
+                button(text("+").size(16))
+                    .padding([6, 12])
+                    .style(move |_, status| theme::nav_button(t, false, status))
+                    .on_press(Message::Run(Command::NewTab)),
+            )
+            .height(Fill)
+            .center_y(Fill),
+        );
         scrollable(bar)
             .id(TABS)
             .direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::new().width(0).scroller_width(0)))
@@ -5640,6 +6383,13 @@ impl App {
         let mut line = Row::new().spacing(10).align_y(iced::Center).push(text(&toast.text).size(13).color(t.text));
         if toast.undo.is_some() {
             line = line.push(small("Undo", Message::UndoTrash));
+        }
+        if let Some((path, line_no)) = &toast.open {
+            let open = match line_no {
+                Some(n) => Message::OpenAt(path.clone(), *n as usize),
+                None => Message::Open(path.clone()),
+            };
+            line = line.push(small("Open", open));
         }
         line = line.push(small("×", Message::DismissToast));
         let card = container(line).padding([8, 12]).max_width(560).style(move |_| theme::panel(t));
@@ -5781,12 +6531,18 @@ impl App {
         let placeholder = match palette.mode {
             PaletteMode::Search => "Find a note or a command".to_owned(),
             PaletteMode::Rename(_) => "New name, with folders to move the note".to_owned(),
+            PaletteMode::MoveTo(_) => "Move the note to a folder".to_owned(),
             PaletteMode::RenameFolder(_) => "New name or path for the folder".to_owned(),
             PaletteMode::Template(_) => "Insert a template".to_owned(),
             PaletteMode::QuickAdd => "Quick add".to_owned(),
             PaletteMode::Everywhere(_) => "Search everywhere".to_owned(),
             PaletteMode::NewFolder => "Name of the new folder, with / for folders in folders".to_owned(),
             PaletteMode::NewNote => "Name of the new note, with / for folders".to_owned(),
+            PaletteMode::Project(_) => "Choose a project".to_owned(),
+            PaletteMode::LogEntry { .. } => "What happened? Start with meeting:, email:, decision: or info:".to_owned(),
+            PaletteMode::Triage(_) => "Choose a line to sort".to_owned(),
+            PaletteMode::TriageAction(_) => "What should this line become?".to_owned(),
+            PaletteMode::Person(..) => "Choose a person".to_owned(),
             PaletteMode::QuickAddValue(i) => match self.quick_entries().get(i) {
                 Some(QuickAdd::Capture { name, .. }) => format!("{name}: what to add"),
                 Some(entry) => format!("{}: name of the new note", entry.name()),
@@ -5877,6 +6633,49 @@ fn conflict_copies(files: &[FileRow], path: &str) -> Vec<String> {
         })
         .map(|f| f.path.clone())
         .collect()
+}
+
+/// The frontmatter's own lines, between the `---` fences, from a note read
+/// a line at a time by `line`, or `None` when it has none. Live preview asks
+/// on every frame, so only the lines up to the closing fence are read rather
+/// than the whole note.
+fn frontmatter_in(line: impl Fn(usize) -> Option<String>) -> Option<Vec<String>> {
+    // A byte-order mark may sit before the opening fence.
+    if line(0)?.trim_start_matches('\u{feff}').trim_end() != "---" {
+        return None;
+    }
+    let mut inner = Vec::new();
+    loop {
+        let next = line(inner.len() + 1)?;
+        if matches!(next.trim_end(), "---" | "...") {
+            return Some(inner);
+        }
+        inner.push(next);
+    }
+}
+
+/// The folders that hold notes, with the folders above them, and those with
+/// `disk`'s folders added as well: what the settings and the tree offer.
+/// Each sorted without regard to case, with duplicates gone.
+fn folder_lists(files: &[FileRow], disk: &[String]) -> (Vec<String>, Vec<String>) {
+    let sorted = |mut folders: Vec<String>| {
+        // Case breaks ties, so that the same name twice ends up side by side.
+        folders.sort_by_cached_key(|f| (f.to_lowercase(), f.clone()));
+        folders.dedup();
+        folders
+    };
+    let mut seen = HashSet::new();
+    let mut notes = Vec::new();
+    // Notes come a folder at a time, so most are passed over by one lookup.
+    for file in files.iter().filter(|f| !f.folder.is_empty()) {
+        if seen.insert(file.folder.as_str()) {
+            let folder = format!("{}/", file.folder);
+            notes.extend(tree::ancestors(&folder).map(str::to_owned));
+        }
+    }
+    let notes = sorted(notes);
+    let all = sorted(notes.iter().chain(disk).cloned().collect());
+    (notes, all)
 }
 
 /// A note's headings, for the outline: level, text and line.
@@ -6065,6 +6864,28 @@ fn rename_hits(from: &str, query: &str, files: &[FileRow], reader: Option<&Conne
     vec![hit]
 }
 
+/// The palette while moving the note at `from`: the folders matching the
+/// query, each moving the note there under its own name.
+fn move_hits(from: &str, query: &str, folders: &[String], files: &[FileRow]) -> Vec<Hit> {
+    let (current, name) = from.rsplit_once('/').unwrap_or(("", from));
+    let filter = query.trim().to_lowercase();
+    let root = std::iter::once(String::new());
+    root.chain(folders.iter().cloned())
+        .filter(|f| f.to_lowercase().contains(&filter) || (f.is_empty() && "vault root".contains(&filter)))
+        .map(|folder| {
+            let label = if folder.is_empty() { "Vault root".to_owned() } else { format!("{folder}/") };
+            let to = if folder.is_empty() { name.to_owned() } else { format!("{folder}/{name}") };
+            if folder == current {
+                Hit { label, detail: "the note is here".into(), action: HitAction::Nothing }
+            } else if files.iter().any(|f| f.path == to) {
+                Hit { label, detail: format!("{name} already exists there"), action: HitAction::Nothing }
+            } else {
+                Hit { label, detail: "move here, links are updated".into(), action: HitAction::Rename(to) }
+            }
+        })
+        .collect()
+}
+
 /// The palette while moving the folder at `from`: where it would go and how
 /// many notes go with it.
 fn folder_hits(from: &str, query: &str, files: &[FileRow]) -> Vec<Hit> {
@@ -6114,6 +6935,19 @@ fn new_folder_hits(query: &str, folders: &[String]) -> Vec<Hit> {
         return vec![Hit { label: format!("{folder}/ exists already"), detail: String::new(), action: HitAction::Nothing }];
     }
     vec![Hit { label: format!("Create folder \u{201c}{folder}\u{201d}"), detail: format!("{folder}/"), action: HitAction::CreateFolder(folder) }]
+}
+
+/// The full-text query the palette runs for what is typed, if any. Every key
+/// runs it, and a word of one or two letters as a prefix matches nearly every
+/// note, all of which FTS then ranks: nothing below two letters, and a last
+/// word under three matches only as a whole word. Names still match by part.
+fn palette_fts(query: &str) -> Option<String> {
+    if query.trim().chars().count() < 2 {
+        return None;
+    }
+    let fts = sage_db::fts_query(query)?;
+    let last = query.split_whitespace().last()?;
+    if last.chars().count() < 3 { fts.strip_suffix('*').map(str::to_owned) } else { Some(fts) }
 }
 
 /// What a Quick Add entry does, in a few words, and its shortcut.
@@ -6262,6 +7096,31 @@ fn with_ending(text: &str, ending: &str) -> String {
     if ending == "\n" { text } else { text.replace('\n', ending) }
 }
 
+/// Runs editing command `op` on only the lines it can touch: those the
+/// selection from `anchor` to `head` spans, and one on either side, which
+/// moving lines swaps with. The note has `count` lines and `line` reads one.
+/// Enter, Backspace and the brackets run a command on every key, and the
+/// whole note copied out line by line each time would cost more than the
+/// command. Positions go in and come back as in the whole note.
+fn windowed(
+    count: usize,
+    line: impl Fn(usize) -> String,
+    anchor: Pos,
+    head: Pos,
+    op: impl FnOnce(&[String], Pos, Pos) -> Option<edit::Change>,
+) -> Option<edit::Change> {
+    let first = anchor.line.min(head.line).saturating_sub(1);
+    let last = (anchor.line.max(head.line) + 1).min(count.saturating_sub(1)).max(first);
+    let lines: Vec<String> = (first..=last).map(line).collect();
+    let local = |p: Pos| Pos::new(p.line - first, p.col);
+    let mut change = op(&lines, local(anchor), local(head))?;
+    change.first += first;
+    change.last += first;
+    change.anchor.line += first;
+    change.head.line += first;
+    Some(change)
+}
+
 /// Whether a note's preview and outline should wait rather than be parsed
 /// again now: only for a note slow to parse (`cost`), while typing goes on
 /// (`since_edit`), and not for longer than `PARSE_STALE` (`since_parse`).
@@ -6272,6 +7131,34 @@ fn parse_waits(cost: Duration, since_edit: Duration, since_parse: Duration) -> b
 /// The active tab once the tabs for which `removed` holds are closed: the
 /// same note if it stays open, else the one that takes its place, else the
 /// last. Closing a tab to the left of the active one must not switch notes.
+/// Closes the task notes that `targets`, link targets written in the note
+/// `from`, name. A target that is no task note is left alone, as is a note
+/// that fails to write: the checkbox has been checked either way. Returns the
+/// vault paths of the notes closed.
+fn close_linked_notes(db_path: &Path, vault: &Path, from: &str, targets: &[String], backend: Backend) -> Vec<String> {
+    let Ok(db) = sage_db::open_reader(db_path) else { return Vec::new() };
+    let mut closed = Vec::new();
+    for target in targets {
+        let full = sage_core::target_key(target, from);
+        let name = sage_core::name_key(target);
+        let found: Option<String> = db
+            .query_row(
+                "SELECT f.path FROM files f JOIN v_documents d ON d.id = f.id
+                 WHERE d.type = 'task' AND (f.name_key = ?1 OR f.id_key = ?1)
+                   AND (?2 = ?1 OR lower(f.path) LIKE '%' || ?2 || '.md')",
+                [&name, &full],
+                |r| r.get(0),
+            )
+            .ok();
+        if let Some(path) = found {
+            if sage_editor::tasks::close_document(&vault.join(&path), backend) == Ok(true) {
+                closed.push(path);
+            }
+        }
+    }
+    closed
+}
+
 fn active_after<T>(active: usize, tabs: &[T], removed: impl Fn(&T) -> bool) -> usize {
     let before = tabs.iter().take(active).filter(|t| removed(t)).count();
     let left = tabs.iter().filter(|t| !removed(t)).count();
@@ -6542,8 +7429,24 @@ fn function_key(named: Named) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::sanitize_note_name as s;
-    use super::{active_after, new_folder_hits, parse_waits, place, with_ending, HitAction};
+    use super::{
+        active_after, folder_lists, frontmatter_in, move_hits, new_folder_hits, palette_fts, parse_waits, place, windowed, with_ending, FileRow,
+        HitAction,
+    };
+    use sage_editor::edit::{self, Format, Pos};
     use iced::widget::text_editor::{Content, Cursor, Position};
+
+    #[test]
+    fn moving_a_note_offers_the_other_folders() {
+        let folders = ["Archive".to_owned(), "Work/Docs".to_owned()];
+        let hits = move_hits("Work/Docs/a.md", "", &folders, &[]);
+        let targets: Vec<Option<String>> =
+            hits.iter().map(|h| if let HitAction::Rename(to) = &h.action { Some(to.clone()) } else { None }).collect();
+        assert_eq!(targets, [Some("a.md".to_owned()), Some("Archive/a.md".to_owned()), None], "the folder it is in is no choice");
+        let hits = move_hits("a.md", "arch", &folders, &[]);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].label, "Archive/");
+    }
 
     #[test]
     fn placing_the_cursor_forgets_an_old_selection() {
@@ -6609,6 +7512,74 @@ mod tests {
         assert!(matches!(&hits[..], [hit] if matches!(hit.action, HitAction::Nothing)), "exists already, any case");
         let hits = new_folder_hits(".sage", &folders);
         assert!(matches!(&hits[..], [hit] if matches!(hit.action, HitAction::Nothing)), "hidden names are dropped");
+    }
+
+    #[test]
+    fn editing_commands_see_the_same_on_a_few_lines_as_on_the_whole_note() {
+        type Op = Box<dyn Fn(&[String], Pos, Pos) -> Option<edit::Change>>;
+        let lines: Vec<String> = ["- one", "  - two", "", "plain (x) **", "> quote", "- [ ] last"].map(String::from).to_vec();
+        let ops: Vec<Op> = vec![
+            Box::new(|l, a, h| Some(edit::toggle(l, a, h, Format::Bold))),
+            Box::new(|l, a, h| Some(edit::link(l, a, h))),
+            Box::new(|l, _, h| edit::enter(l, h, "  ")),
+            Box::new(|l, a, h| edit::indent(l, a, h, false, "  ")),
+            Box::new(|l, a, h| edit::indent(l, a, h, true, "  ")),
+            Box::new(|l, a, h| edit::move_lines(l, a, h, true)),
+            Box::new(|l, a, h| edit::move_lines(l, a, h, false)),
+            Box::new(|l, a, h| Some(edit::duplicate(l, a, h))),
+            Box::new(|l, a, h| edit::type_char(l, a, h, '(')),
+            Box::new(|l, _, h| edit::backspace(l, h)),
+        ];
+        // Carets and selections at the top, in the middle, over lines and at the bottom.
+        let places = [
+            (Pos::new(0, 2), Pos::new(0, 2)),
+            (Pos::new(3, 7), Pos::new(3, 7)),
+            (Pos::new(1, 0), Pos::new(4, 3)),
+            (Pos::new(5, 10), Pos::new(5, 6)),
+        ];
+        for op in &ops {
+            for (anchor, head) in places {
+                let few = windowed(lines.len(), |i| lines[i].clone(), anchor, head, |l, a, h| op(l, a, h));
+                assert_eq!(few, op(&lines, anchor, head), "at {anchor:?}..{head:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn frontmatter_is_read_up_to_its_closing_fence() {
+        let read = |text: &str| {
+            let lines: Vec<String> = text.split('\n').map(str::to_owned).collect();
+            frontmatter_in(|i| lines.get(i).cloned())
+        };
+        let owned = |lines: &[&str]| Some(lines.iter().map(|l| l.to_string()).collect::<Vec<_>>());
+        assert_eq!(read("---\ntags: [a]\nup: x\n---\nbody"), owned(&["tags: [a]", "up: x"]));
+        assert_eq!(read("\u{feff}---\na: 1\n...\nbody"), owned(&["a: 1"]), "a byte-order mark, and YAML's other end");
+        assert_eq!(read("---\n---\nbody"), owned(&[]), "empty");
+        assert_eq!(read("---\na: 1\nno end"), None, "never closed");
+        assert_eq!(read("# Title\n---\na: 1\n---"), None, "not at the top");
+    }
+
+    #[test]
+    fn folder_lists_hold_every_ancestor_once() {
+        let row = |path: &str| {
+            let folder = path.rsplit_once('/').map_or("", |(f, _)| f);
+            FileRow { path: path.into(), folder: folder.into(), title: String::new(), cloud: false, modified: 0 }
+        };
+        let files = [row("a.md"), row("Work/b.md"), row("Work/Docs/c.md"), row("Work/Docs/d.md"), row("archive/e.md")];
+        let disk = ["Empty".to_owned(), "Work".to_owned()];
+        let (notes, all) = folder_lists(&files, &disk);
+        assert_eq!(notes, ["archive", "Work", "Work/Docs"], "sorted without regard to case");
+        assert_eq!(all, ["archive", "Empty", "Work", "Work/Docs"]);
+    }
+
+    #[test]
+    fn the_palette_searches_text_only_for_two_letters_or_more() {
+        assert_eq!(palette_fts("a"), None);
+        assert_eq!(palette_fts(" a "), None);
+        assert_eq!(palette_fts("ab").as_deref(), Some("\"ab\""), "a whole word, not every word starting so");
+        assert_eq!(palette_fts("abc").as_deref(), Some("\"abc\"*"));
+        assert_eq!(palette_fts("plan q").as_deref(), Some("\"plan\" \"q\""), "a short last word is whole too");
+        assert_eq!(palette_fts("plan qu4").as_deref(), Some("\"plan\" \"qu4\"*"));
     }
 
     #[test]

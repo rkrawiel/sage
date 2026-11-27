@@ -6,14 +6,24 @@
 //! `live_editor.rs` draws the pieces and edits the text, which stays plain
 //! Markdown throughout.
 
+use iced::advanced::graphics::text::cosmic_text;
 use std::ops::Range;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
 /// The names a link can use to reach a note: every path suffix without its
 /// extension, and every alias, in lowercase. Set by the app from the index so
 /// that links to notes that do not exist can be drawn differently.
 static KNOWN: RwLock<Option<HashSet<String>>> = RwLock::new(None);
+/// Counts the changes to `KNOWN`, so the pane knows to lay its lines out again
+/// when a link's note appears or goes, with the text and cursor unchanged.
+static KNOWN_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Which `KNOWN` the lines would be worked out against now.
+pub fn known_generation() -> u64 {
+    KNOWN_GENERATION.load(Ordering::Relaxed)
+}
 
 pub fn set_known(paths: impl Iterator<Item = String>, aliases: Vec<String>) {
     let mut names: HashSet<String> = aliases.into_iter().collect();
@@ -29,8 +39,12 @@ pub fn set_known(paths: impl Iterator<Item = String>, aliases: Vec<String>) {
             }
         }
     }
+    // Every pass of the index sets it; only a real change lays the pane out again.
     if let Ok(mut known) = KNOWN.write() {
-        *known = Some(names);
+        if known.as_ref() != Some(&names) {
+            *known = Some(names);
+            KNOWN_GENERATION.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -163,18 +177,29 @@ impl Caret {
     }
 }
 
+/// What one line passes on to the next: the block it ends in and the callout
+/// it is part of. It never depends on the cursor, so a line can be worked out
+/// again on its own, from what the line before passed on, when only the
+/// cursor moved.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Carry {
+    state: State,
+    callout: Option<String>,
+}
+
 /// Every line of the note, with what to show of it.
+#[cfg(test)]
 pub fn lines<S: AsRef<str>>(text: &[S], caret: Option<Caret>) -> Vec<Line> {
-    let mut state = State::Body;
-    let mut callout = None;
-    text.iter()
-        .enumerate()
-        .map(|(n, line)| {
-            let line = line.as_ref();
-            let at = caret.and_then(|c| c.on(n, line.len()));
-            self::line(line, n == 0, &mut state, &mut callout, at.as_ref())
-        })
-        .collect()
+    let mut carry = Carry::default();
+    text.iter().enumerate().map(|(n, line)| next_line(line.as_ref(), n, &mut carry, caret)).collect()
+}
+
+/// Line `n` of the note, `text`, with what to show of it. `carry` is what the
+/// line before passed on (the default for the first line), and becomes what
+/// this line passes on.
+pub fn next_line(text: &str, n: usize, carry: &mut Carry, caret: Option<Caret>) -> Line {
+    let at = caret.and_then(|c| c.on(n, text.len()));
+    line(text, n == 0, &mut carry.state, &mut carry.callout, at.as_ref())
 }
 
 /// Whether the cursor or selection touches a span, ends included: a cursor
@@ -205,7 +230,7 @@ fn line(text: &str, first: bool, state: &mut State, callout: &mut Option<String>
             }
             return whole(Kind::Code);
         }
-        State::Body if first && text.trim_end() == "---" => {
+        State::Body if first && text.trim_start_matches('\u{feff}').trim_end() == "---" => {
             *state = State::Frontmatter;
             return whole(Kind::Frontmatter);
         }
@@ -313,8 +338,10 @@ fn line(text: &str, first: bool, state: &mut State, callout: &mut Option<String>
 
 /// `---`, `***` or `___`, three or more, spaces allowed between.
 fn is_rule(text: &str) -> bool {
-    let marks: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-    marks.len() >= 3 && ["-", "*", "_"].iter().any(|m| marks.chars().all(|c| c.to_string() == *m))
+    let mut marks = text.chars().filter(|c| !c.is_whitespace());
+    let first = marks.next();
+    let count = marks.try_fold(1, |n, c| (Some(c) == first).then_some(n + 1));
+    matches!(first, Some('-' | '*' | '_')) && count.is_some_and(|n| n >= 3)
 }
 
 enum Marker {
@@ -537,22 +564,35 @@ fn find_closer(b: &[u8], from: usize, end: usize, c: u8, n: usize) -> Option<usi
 pub struct Island {
     pub lines: Range<usize>,
     pub blocks: Vec<sage_markdown::Block>,
+    /// The lines `blocks` were parsed from, joined, so the next edit can tell
+    /// whether they changed.
+    source: String,
 }
 
 /// The note's islands, in order. Only blocks at the top level count: a table
-/// inside a quote or a list stays text.
-pub fn islands(text: &str) -> Vec<Island> {
+/// inside a quote or a list stays text. An island of `previous`, the islands
+/// before the edit, whose lines did not change is kept rather than parsed
+/// again, wherever it moved.
+pub fn islands(text: &str, mut previous: Vec<Island>) -> Vec<Island> {
     use sage_markdown::Block;
-    let lines: Vec<&str> = text.lines().collect();
+    // Split where the editor splits, lone `\r` and `\n\r` included, so an
+    // island's lines are the lines the pane shows; `str::lines` would differ.
+    let lines: Vec<&str> = cosmic_text::LineIter::new(text).map(|(range, _)| &text[range]).collect();
     let mut out = Vec::new();
     let mut keep = |range: Range<usize>, fits: fn(&Block) -> bool| {
-        let blocks = sage_markdown::parse(&lines[range.clone()].join("\n"));
+        let source = lines[range.clone()].join("\n");
+        if let Some(i) = previous.iter().position(|island| island.source == source && island.blocks.first().is_some_and(fits)) {
+            out.push(Island { lines: range, ..previous.swap_remove(i) });
+            return;
+        }
+        let blocks = sage_markdown::parse(&source);
         if blocks.first().is_some_and(fits) {
-            out.push(Island { lines: range, blocks });
+            out.push(Island { lines: range, blocks, source });
         }
     };
     let mut i = 0;
-    if lines.first().is_some_and(|l| l.trim_end() == "---") {
+    // A byte-order mark may sit before the opening fence.
+    if lines.first().is_some_and(|l| l.trim_start_matches('\u{feff}').trim_end() == "---") {
         match lines.iter().skip(1).position(|l| matches!(l.trim_end(), "---" | "...")) {
             Some(n) => {
                 keep(0..n + 2, |b| matches!(b, Block::Properties(_)));
@@ -661,6 +701,55 @@ pub fn to_source(segs: &[Seg], shown: usize) -> usize {
 mod tests {
     use super::*;
 
+    /// A note's islands, with none from before an edit to keep.
+    fn islands_of(text: &str) -> Vec<Island> {
+        islands(text, Vec::new())
+    }
+
+    #[test]
+    fn unchanged_islands_are_kept_where_they_moved() {
+        let before = islands_of("| a |\n|---|\n| 1 |\n\n![[pic.png]]\n");
+        let after = islands("new line\n| a |\n|---|\n| 1 |\n\n![[other.png]]\n", before.clone());
+        assert_eq!(after[0].lines, 1..4, "the table moved down a line");
+        assert_eq!((&after[0].blocks, &after[0].source), (&before[0].blocks, &before[0].source));
+        assert_eq!(after[1].blocks, islands_of("![[other.png]]")[0].blocks, "the changed embed is parsed again");
+    }
+
+    #[test]
+    fn islands_count_lines_as_the_editor_does() {
+        // A lone carriage return breaks the line in the editor, so it must here too.
+        let text = "intro\rmore\n| a |\r\n|---|\n| 1 |\n";
+        assert_eq!(islands_of(text)[0].lines, 2..5);
+        let content = iced::widget::text_editor::Content::<iced::Renderer>::with_text(text);
+        assert_eq!(content.line(2).map(|l| l.text.into_owned()).as_deref(), Some("| a |"));
+    }
+
+    #[test]
+    fn a_line_worked_out_on_its_own_matches_the_whole_note() {
+        let note = ["---", "a: b", "---", "> [!note] Title", "> **body** [[x]]", "```", "# not a heading", "```", "## Head **b**"];
+        let caret = Some(Caret::new((4, 3), (6, 1)));
+        let all = lines(&note, caret);
+        let mut carry = Carry::default();
+        let mut carries = Vec::new();
+        for (n, text) in note.iter().enumerate() {
+            carries.push(carry.clone());
+            next_line(text, n, &mut carry, None);
+        }
+        for (n, text) in note.iter().enumerate() {
+            assert_eq!(next_line(text, n, &mut carries[n].clone(), caret), all[n], "line {n}");
+        }
+    }
+
+    #[test]
+    fn rules_need_three_of_one_mark() {
+        for rule in ["---", "***", "___", "- - -", " *  * * * "] {
+            assert!(is_rule(rule), "{rule:?}");
+        }
+        for text in ["--", "-*-", "", "   ", "-- x", "———"] {
+            assert!(!is_rule(text), "{text:?}");
+        }
+    }
+
     #[test]
     fn links_to_notes_that_do_not_exist_are_missing() {
         set_known(["People/John.md", "Plan.md"].into_iter().map(str::to_owned), vec!["jo".into()]);
@@ -672,6 +761,14 @@ mod tests {
         assert!(!is_missing("photo.png"), "an attachment");
         assert!(is_missing("Nobody"));
         assert!(is_missing("Other/Plan"));
+
+        // The pane lays out again when a note appears, and only then.
+        let generation = known_generation();
+        set_known(["People/John.md", "Plan.md"].into_iter().map(str::to_owned), vec!["jo".into()]);
+        assert_eq!(known_generation(), generation, "the same notes");
+        set_known(["People/John.md", "Plan.md", "Nobody.md"].into_iter().map(str::to_owned), vec!["jo".into()]);
+        assert_eq!(known_generation(), generation + 1);
+        assert!(!is_missing("Nobody"));
     }
 
     /// What a one-line note shows with the cursor at `cursor`, if anywhere.
@@ -825,8 +922,8 @@ mod tests {
         assert_eq!(kinds(&["```", "~~~", "```", "x"]), [Fence, Code, Fence, Text]);
         assert_eq!(kinds(&["```", "```rust", "```", "x"]), [Fence, Code, Fence, Text], "a fence with a language never closes");
         assert_eq!(kinds(&["```", "`````", "x"]), [Fence, Fence, Text], "a longer fence closes");
-        assert!(islands("````markdown\n```view\nsource: x\n```\n````\n").is_empty(), "a view block shown as code");
-        assert_eq!(islands("~~~\n```\n~~~\n```view\nsource: x\n```\n")[0].lines, 3..6);
+        assert!(islands_of("````markdown\n```view\nsource: x\n```\n````\n").is_empty(), "a view block shown as code");
+        assert_eq!(islands_of("~~~\n```\n~~~\n```view\nsource: x\n```\n")[0].lines, 3..6);
     }
 
     #[test]
@@ -863,7 +960,7 @@ mod tests {
     #[test]
     fn blocks_the_preview_draws_are_islands() {
         let note = "---\ntags: [a]\n---\n# Title\n\n| a | b |\n|:--|--:|\n| 1 | 2 |\n\n![[Other note]]\n![alt|200](pic.png)\n\n```view\nsource: \"#a\"\n```\n\n```tasks\nstatus != done\n```\n\n```rust\n| not | a |\n|---|---|\n```\n> | quoted | table |\n> |---|---|\ntext ![[inline]] here\n";
-        let found: Vec<(Range<usize>, &str)> = islands(note)
+        let found: Vec<(Range<usize>, &str)> = islands_of(note)
             .into_iter()
             .map(|i| {
                 let kind = match &i.blocks[0] {
@@ -891,16 +988,21 @@ mod tests {
     }
 
     #[test]
+    fn frontmatter_after_a_byte_order_mark_is_still_frontmatter() {
+        assert_eq!(islands_of("\u{feff}---\ntitle: x\n---\nbody").len(), 1);
+    }
+
+    #[test]
     fn broken_or_open_blocks_are_not_islands() {
-        assert!(islands("---\ntitle: x\nno end").is_empty(), "frontmatter never closed");
-        assert!(islands("```view\nsource: x").is_empty(), "fence never closed");
-        assert!(islands("| a | b |\nnot a delimiter\n").is_empty());
-        assert!(islands("    ![[indented]]").is_empty());
+        assert!(islands_of("---\ntitle: x\nno end").is_empty(), "frontmatter never closed");
+        assert!(islands_of("```view\nsource: x").is_empty(), "fence never closed");
+        assert!(islands_of("| a | b |\nnot a delimiter\n").is_empty());
+        assert!(islands_of("    ![[indented]]").is_empty());
     }
 
     #[test]
     fn the_cursor_inside_an_island_shows_it_as_written() {
-        let island = &islands("intro\n| a |\n|---|\n| 1 |\nafter")[0];
+        let island = &islands_of("intro\n| a |\n|---|\n| 1 |\nafter")[0];
         assert_eq!(island.lines, 1..4);
         let at = |line| Caret::new((line, 0), (line, 0));
         assert!(!touches_island(&island.lines, at(0)));

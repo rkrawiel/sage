@@ -1,0 +1,45 @@
+{
+  "templates_folder": "Templates",
+  "new_note_template": "Templates/Template, regular note.md",
+  "quick_add": [
+    {
+      "kind": "template",
+      "name": "Meeting note",
+      "template": "Templates/Template, meeting note.md",
+      "folder": "MeetingNotes",
+      "file_name": "{{date:YYYY-MM-DD_HH-mm}} {{value}}",
+      "open": true,
+      "shortcut": "Ctrl+Alt+Shift+M"
+    },
+    {
+      "kind": "template",
+      "name": "Project",
+      "template": "Templates/Template, project.md",
+      "folder": "1. Projects",
+      "file_name": "{{value}}",
+      "open": true,
+      "shortcut": "Ctrl+Alt+Shift+P"
+    },
+    {
+      "kind": "template",
+      "name": "Person",
+      "template": "Templates/Template, person.md",
+      "folder": "People",
+      "file_name": "{{value}}",
+      "open": true,
+      "shortcut": "Ctrl+Alt+Shift+U"
+    },
+    {
+      "kind": "template",
+      "name": "Book",
+      "template": "Templates/Template, book.md",
+      "folder": "SecondBrain",
+      "file_name": "{{value}}",
+      "open": true,
+      "shortcut": "Ctrl+Alt+Shift+B"
+    }
+  ],
+  "property_types": {
+    "status": "text"
+  }
+}

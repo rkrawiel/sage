@@ -229,6 +229,25 @@ pub fn view(ctx: Ctx<'_>) -> Element<'_, Message> {
          plain checklists. New task lines get #task."
             .into(),
     ));
+    page = page.push(check(
+        "Show system notifications for reminders",
+        ctx.settings.notifications != Some(false),
+        Message::SettingsNotifications,
+        t,
+    ));
+    let time = ctx.settings.reminder_time.as_deref().unwrap_or("");
+    page = page.push(labelled(
+        "Default reminder time",
+        input(sage_editor::reminders::DEFAULT_TIME, time, Message::SettingsReminderTime, t),
+    ));
+    let valid = time.is_empty() || sage_editor::reminders::parse_time(time).is_some();
+    page = page.push(hint(if valid {
+        "A task reminds when it has (@2026-12-01 09:30), or (@2026-12-01) for this time; a task note when it has a \
+         reminder property. Sage notifies while it runs, and tells the reminders missed since at its next start."
+            .into()
+    } else {
+        format!("`{time}` is not a time as HH:MM, so {} is used.", sage_editor::reminders::DEFAULT_TIME)
+    }));
 
     // Quick Add.
     page = page.push(container(section("QUICK ADD")).padding(iced::Padding { top: 12.0, ..iced::Padding::ZERO }));

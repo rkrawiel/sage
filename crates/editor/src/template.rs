@@ -1,5 +1,8 @@
 //! Templates in Obsidian's core syntax: `{{title}}`, `{{date}}`, `{{time}}`,
 //! and `{{date:FORMAT}}` / `{{time:FORMAT}}` with Moment.js format tokens.
+//! The commonest Templater tags are read too, for vaults that use that plugin:
+//! `<% tp.date.now("FORMAT") %>`, `<% tp.file.creation_date("FORMAT") %>`,
+//! `<% tp.file.title %>`. Anything else of Templater's is left as written.
 
 use chrono::{Datelike, NaiveDateTime, Timelike};
 use regex::{Captures, Regex};
@@ -42,10 +45,21 @@ impl Config {
 static VARIABLE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\{\{\s*(title|date|time)\s*(?::([^}]*))?\}\}").unwrap());
 
+static TEMPLATER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"<%[-_]?\s*tp\.(?:(date)\.now|file\.(creation_date|last_modified_date)|(file)\.title)\s*(?:\(\s*(?:"([^"]*)"|'([^']*)')?[^)]*\))?\s*[-_]?%>"#).unwrap()
+});
+
 /// Fills in the variables of `template` for the note called `title`.
 pub fn expand(template: &str, title: &str, now: NaiveDateTime, config: &Config) -> String {
+    let template = TEMPLATER.replace_all(template, |c: &Captures| {
+        if c.get(3).is_some() {
+            return title.to_owned();
+        }
+        let format = c.get(4).or_else(|| c.get(5)).map_or("YYYY-MM-DD", |m| m.as_str());
+        moment(format, now)
+    });
     VARIABLE
-        .replace_all(template, |c: &Captures| {
+        .replace_all(&template, |c: &Captures| {
             let format = c.get(2).map(|m| m.as_str().trim());
             match c[1].to_lowercase().as_str() {
                 "title" => title.to_owned(),
@@ -228,6 +242,17 @@ mod tests {
             &config,
         );
         assert_eq!(out, "# Kickoff\n13.11.2026 09:30 2026-W46 9 AM {{other}}");
+    }
+
+    #[test]
+    fn expands_the_common_templater_tags() {
+        let out = expand(
+            "Date: <% tp.file.creation_date(\"YYYY-MM-DD\") %>\n<%tp.date.now('DD.MM')%> <% tp.file.title %> <% tp.system.prompt() %>",
+            "Sync",
+            at("2026-11-13 09:30:00"),
+            &Config::default(),
+        );
+        assert_eq!(out, "Date: 2026-11-13\n13.11 Sync <% tp.system.prompt() %>");
     }
 
     #[test]
